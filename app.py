@@ -1,4 +1,4 @@
-# app.py — NHL Player Scouting Dashboard (club-stats only; no standings)
+# app.py — NHL Player Scouting Dashboard (sidebar-first layout, robust goalie fixes)
 # ----------------------------------------------------------------------
 # Run locally:  pip install -r requirements.txt && streamlit run app.py
 # requirements.txt:
@@ -15,6 +15,7 @@ import requests
 import datetime as dt
 import plotly.express as px
 
+# ----------------------------- Page & options -----------------------------
 st.set_page_config(page_title="NHL Player Scouting Dashboard", layout="wide")
 pd.set_option("display.max_columns", 0)
 
@@ -24,7 +25,7 @@ TEAM_ABBRS = [
     "VAN","VGK","WPG","WSH"
 ]
 
-# ----------------------------- Utils -----------------------------
+# ----------------------------- Utilities -----------------------------
 def get_json(url: str):
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -36,7 +37,7 @@ def nhl_season_label_for_date(d=None) -> int:
     return int(f"{start}{start+1}")
 
 def season_options(num=8):
-    """[current, prev1, prev2, ...] as ints like 20252026."""
+    """[current, prev1, prev2, ...] e.g., 20252026, 20242025, ..."""
     cur = nhl_season_label_for_date()
     start = int(str(cur)[:4])
     return [int(f"{start-i}{start-i+1}") for i in range(num)]
@@ -75,7 +76,7 @@ def auto_height(df, row_px=35, min_px=120, max_px=600):
     rows = max(1, len(df))
     return int(np.clip(rows * row_px + 60, min_px, max_px))
 
-# ----------------------------- API wrappers -----------------------------
+# ----------------------------- NHL API helpers -----------------------------
 def search_players(q: str, limit=25) -> pd.DataFrame:
     data = get_json(f"https://search.d3.nhle.com/api/v1/search/player?culture=en-us&limit={limit}&q={q}")
     return pd.json_normalize(data)
@@ -94,14 +95,13 @@ def player_game_log(player_id: int, season: int, game_type: int = 2) -> pd.DataF
 def fetch_club_stats_goalies_safe(team_abbr: str, season: int, game_type: int = 2) -> pd.DataFrame:
     """
     Always use club-stats for team-level baselines.
-    If current season 404s for a team, auto-fallback to previous season for that team.
+    If current season 404s for a team, auto-fallback to previous season for that team (only).
     """
     try:
         data = get_json(f"https://api-web.nhle.com/v1/club-stats/{team_abbr}/{season}/{game_type}")
         return pd.json_normalize(data.get("goalies", []))
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            # fallback to previous season for this team
             start = int(str(season)[:4])
             prev = int(f"{start-1}{start}")
             try:
@@ -112,29 +112,33 @@ def fetch_club_stats_goalies_safe(team_abbr: str, season: int, game_type: int = 
                 return pd.DataFrame()
         return pd.DataFrame()
 
-# ----------------------------- League & Opponent baselines (club-stats only) -----------------------------
+# ----------------------------- Baselines & adjusters (club-stats only) -----------------------------
 def clubstats_sa_ga_pg_for_team(team_abbr: str, season: int, game_type: int = 2):
     """
     From goalies table:
-      SA_sum = sum(shotsAgainst), SV_sum = sum(saves), GP_sum = sum(gamesPlayed)
+      SA_sum = sum(shotsAgainst/shots), SV_sum = sum(saves/sv), GP_sum = sum(gamesPlayed)
       SA/GP = SA_sum / GP_sum; GA/GP = (SA_sum - SV_sum) / GP_sum
-    Uses per-team season fallback (previous season) if needed.
+    Robust to field name variants.
     """
     gdf = fetch_club_stats_goalies_safe(team_abbr, season, game_type)
     if gdf.empty:
-        return (np.nan, np.nan, 0.0)  # SA/GP, GA/GP, GP_sum
-    sa = pd.to_numeric(gdf.get("shotsAgainst", 0), errors="coerce").fillna(0).sum()
-    sv = pd.to_numeric(gdf.get("saves", 0), errors="coerce").fillna(0).sum()
-    gp = pd.to_numeric(gdf.get("gamesPlayed", 0), errors="coerce").fillna(0).sum()
+        return (np.nan, np.nan, 0.0)
+    # Handle variants
+    shots_col = "shotsAgainst" if "shotsAgainst" in gdf.columns else ("shots" if "shots" in gdf.columns else None)
+    saves_col = "saves" if "saves" in gdf.columns else ("sv" if "sv" in gdf.columns else None)
+    gp_col    = "gamesPlayed" if "gamesPlayed" in gdf.columns else ("gp" if "gp" in gdf.columns else None)
+    if shots_col is None or gp_col is None:
+        return (np.nan, np.nan, 0.0)
+
+    sa = pd.to_numeric(gdf.get(shots_col, 0), errors="coerce").fillna(0).sum()
+    sv = pd.to_numeric(gdf.get(saves_col, 0), errors="coerce").fillna(0).sum() if saves_col else np.nan
+    gp = pd.to_numeric(gdf.get(gp_col, 0), errors="coerce").fillna(0).sum()
     sa_pg = safe_div(sa, gp)
-    ga_pg = safe_div(sa - sv, gp)
+    ga_pg = safe_div(sa - (sv if np.isfinite(sv) else 0), gp)
     return (sa_pg, ga_pg, gp)
 
 def league_baselines_from_clubstats(season: int, game_type: int = 2):
-    """
-    Sweep all teams via club-stats with per-team season fallback.
-    Compute league SA/GP and GA/GP by averaging teams with finite values (coverage-insensitive).
-    """
+    """Sweep all teams via club-stats with per-team season fallback; average GA/GP and SA/GP."""
     recs = []
     for abbr in TEAM_ABBRS:
         sa_pg, ga_pg, gp = clubstats_sa_ga_pg_for_team(abbr, season, game_type)
@@ -146,12 +150,11 @@ def league_baselines_from_clubstats(season: int, game_type: int = 2):
 
 def opponent_metrics(opponent: str, season: int, game_type: int, league_sa_pg: float, league_ga_pg: float):
     opp_sa_pg, opp_ga_pg, _ = clubstats_sa_ga_pg_for_team(opponent, season, game_type)
-    # Adjusters
     shots_adj = 1.0 if not np.isfinite(opp_sa_pg) or not np.isfinite(league_sa_pg) else float(opp_sa_pg / max(league_sa_pg, 1e-9))
     score_adj = 1.0 if not np.isfinite(opp_ga_pg) or not np.isfinite(league_ga_pg) else float(league_ga_pg / max(opp_ga_pg, 1e-9))
     return opp_ga_pg, opp_sa_pg, score_adj, shots_adj
 
-# ----------------------------- Player & projections -----------------------------
+# ----------------------------- Player helpers & projections -----------------------------
 def resolve_player_team(bio: dict, gl_df: pd.DataFrame, players_df: pd.DataFrame, landing: dict):
     t = (bio or {}).get("currentTeamAbbrev")
     if t: return str(t)
@@ -184,17 +187,24 @@ def career_pg_from_season_totals(stot_df: pd.DataFrame, num_col, gp_col="gamesPl
     gp  = pd.to_numeric(stot_df[gp_col],  errors="coerce").fillna(0).sum()
     return safe_div(num, gp)
 
+def pull(gl_df: pd.DataFrame, names: list):
+    """Return first available column from list of possible names."""
+    for n in names:
+        if n in gl_df.columns:
+            return gl_df[n]
+    return pd.Series(dtype=float)
+
 def skater_projection(gl_df: pd.DataFrame, stot_df: pd.DataFrame, w_recent, w_season, w_career, shots_adj, score_adj, K=5):
     # recent
-    sog_r = series_mean(gl_df["shots"], K)
-    g_r   = series_mean(gl_df["goals"], K)
-    a_r   = series_mean(gl_df["assists"], K)
+    sog_r = series_mean(pull(gl_df, ["shots","shotsOnGoal"]), K)
+    g_r   = series_mean(pull(gl_df, ["goals"]), K)
+    a_r   = series_mean(pull(gl_df, ["assists"]), K)
     sh_r  = safe_div(g_r, sog_r)
 
     # season
-    sog_s = series_mean(gl_df["shots"])
-    g_s   = series_mean(gl_df["goals"])
-    a_s   = series_mean(gl_df["assists"])
+    sog_s = series_mean(pull(gl_df, ["shots","shotsOnGoal"]))
+    g_s   = series_mean(pull(gl_df, ["goals"]))
+    a_s   = series_mean(pull(gl_df, ["assists"]))
     sh_s  = safe_div(g_s, sog_s)
 
     # career (from season totals)
@@ -215,26 +225,33 @@ def skater_projection(gl_df: pd.DataFrame, stot_df: pd.DataFrame, w_recent, w_se
     return pd.DataFrame({"Stat":["PTS","G","A","SOG"], "Proj":[PTS, G, A, SOG]}).round(2)
 
 def goalie_projection(gl_df: pd.DataFrame, stot_df: pd.DataFrame, w_recent, w_season, w_career, shots_adj, K=5):
-    def mean_col(col, k=None):
-        s = pd.to_numeric(gl_df[col], errors="coerce").dropna()
+    # Robust to field names
+    sa_col_series = pull(gl_df, ["shotsAgainst","shots"])
+    sv_col_series = pull(gl_df, ["saves","sv"])
+    svpct_series  = pull(gl_df, ["savePct","savePercentage"])
+
+    def mean_col(series, k=None):
+        s = pd.to_numeric(series, errors="coerce").dropna()
         if s.empty: return np.nan
         if k: s = s.head(k)
         return float(s.mean())
 
-    SA_r = mean_col("shotsAgainst", K)
-    SA_s = mean_col("shotsAgainst")
-    SA_c = career_pg_from_season_totals(stot_df, "shotsAgainst")
+    SA_r = mean_col(sa_col_series, K)
+    SA_s = mean_col(sa_col_series)
+    SA_c = career_pg_from_season_totals(stot_df, "shotsAgainst") if "shotsAgainst" in stot_df.columns else career_pg_from_season_totals(stot_df, "shots")
 
-    if "savePct" in gl_df.columns and gl_df["savePct"].notna().any():
-        SVP_r = series_mean(gl_df["savePct"], K)
-        SVP_s = series_mean(gl_df["savePct"])
+    # Save% from logs if available; else construct from saves/sa
+    if not svpct_series.empty and svpct_series.notna().any():
+        SVP_r = series_mean(svpct_series, K)
+        SVP_s = series_mean(svpct_series)
     else:
-        SVP_r = safe_div(series_mean(gl_df["saves"], K), series_mean(gl_df["shotsAgainst"], K))
-        SVP_s = safe_div(series_mean(gl_df["saves"]), series_mean(gl_df["shotsAgainst"]))
+        SVP_r = safe_div(series_mean(sv_col_series, K), series_mean(sa_col_series, K))
+        SVP_s = safe_div(series_mean(sv_col_series), series_mean(sa_col_series))
 
-    if not stot_df.empty and {"saves","shotsAgainst"}.issubset(stot_df.columns):
-        SVP_c = safe_div(pd.to_numeric(stot_df["saves"], errors="coerce").sum(),
-                         pd.to_numeric(stot_df["shotsAgainst"], errors="coerce").sum())
+    if not stot_df.empty:
+        saves_tot = pd.to_numeric(stot_df.get("saves", stot_df.get("sv", 0)), errors="coerce").sum()
+        sa_tot    = pd.to_numeric(stot_df.get("shotsAgainst", stot_df.get("shots", 0)), errors="coerce").sum()
+        SVP_c     = safe_div(saves_tot, sa_tot)
     else:
         SVP_c = np.nan
 
@@ -260,27 +277,33 @@ def last_n_vs_opponent(player_id: int, opponent_abbr: str, seasons: list, n=5, g
             break
     if not frames:
         return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True).sort_values("gameDate", ascending=False)
-    return out.head(n)
+    out = pd.concat(frames, ignore_index=True).sort_values("gameDate", descending=False)
+    return out.tail(n).sort_values("gameDate", ascending=False).reset_index(drop=True)
 
-# ----------------------------- UI -----------------------------
-st.title("NHL Player Scouting Dashboard")
-
+# ----------------------------- Sidebar (matches NBA app structure) -----------------------------
 with st.sidebar:
-    st.subheader("Filters")
+    st.header("Filters")
     SEASONS = season_options(8)
-    # Default to 2025-26 (index 0)
     SEASON = st.selectbox("Season", SEASONS, index=0, format_func=lambda x: f"{str(x)[:4]}-{str(x)[4:]}")
     GAME_TYPE = st.selectbox("Game Type", {2:"Regular Season", 3:"Playoffs"}, index=0, format_func=lambda x: {2:"Regular",3:"Playoffs"}[x])
+
+    st.markdown("---")
     query = st.text_input("Player search", "McDavid")
+    st.caption("Tip: pick an exact name from the dropdown after typing.")
+
+    st.markdown("---")
     recent_window = st.select_slider("Recent window (games)", options=[5,10,15,20], value=5)
+
     st.markdown("---")
     st.caption("Blend Weights")
     w_recent = st.slider("Recent", 0.0, 1.0, 0.55, 0.05)
     w_season = st.slider("Season", 0.0, 1.0, 0.30, 0.05)
     w_career = st.slider("Career", 0.0, 1.0, 0.15, 0.05)
 
-# Search & select player
+# ----------------------------- Main content -----------------------------
+st.title("NHL Player Scouting Dashboard")
+
+# Player search & select
 players_df = search_players(query)
 if players_df.empty:
     st.warning("No players found. Try another name.")
@@ -288,48 +311,47 @@ if players_df.empty:
 
 players_df = players_df.sort_values(["active"], ascending=False).reset_index(drop=True)
 player_choices = players_df["name"].tolist()
-player_name = st.selectbox("Choose player", player_choices, index=0)
+player_name = st.selectbox("Choose player", player_choices, index=0, key="player_select")
 sel = players_df.loc[players_df["name"] == player_name].iloc[0]
 player_id = int(sel["playerId"])
 position_code = str(sel.get("positionCode", ""))
 
-# Player data
+# Fetch player data
 landing = player_landing(player_id)
 bio = landing.get("playerBio", {}) or {}
 season_totals = pd.json_normalize(landing.get("seasonTotals", []))
 gl = player_game_log(player_id, SEASON, GAME_TYPE)
-# If no logs this season, fallback to earlier seasons for charting
-if gl.empty:
+
+# If no logs this season, fall back for charts (keeps SEASON for baselines)
+chart_gl = gl.copy()
+if chart_gl.empty:
     for s in SEASONS[1:]:
-        gl = player_game_log(player_id, s, GAME_TYPE)
-        if not gl.empty:
-            st.info(f"No logs for {str(SEASON)[:4]}-{str(SEASON)[4:]}. Showing {str(s)[:4]}-{str(s)[4:]} instead for charts.")
+        chart_gl = player_game_log(player_id, s, GAME_TYPE)
+        if not chart_gl.empty:
+            st.info(f"No logs for {str(SEASON)[:4]}-{str(SEASON)[4:]}. Showing {str(s)[:4]}-{str(s)[4:]} for trends.")
             break
 
-# Resolve team (best-effort)
-player_team = resolve_player_team(bio, gl, players_df, landing)
+# Resolve team (best effort)
+player_team = resolve_player_team(bio, chart_gl if not chart_gl.empty else gl, players_df, landing)
 
 # League baselines (club-stats sweep only; with per-team season fallback)
 league_df, league_sa_pg, league_ga_pg = league_baselines_from_clubstats(SEASON, GAME_TYPE)
 
-# Opponent picker (static list; default to most recent opponent if available)
-team_options = TEAM_ABBRS
-opp_default = gl["opponentAbbrev"].dropna().astype(str).iloc[0] if ("opponentAbbrev" in gl.columns and not gl.empty and pd.notna(gl.loc[0,"opponentAbbrev"])) else ("TOR" if (player_team == "MTL") else "MTL")
-if opp_default not in team_options:
-    opp_default = team_options[0]
-opponent = st.selectbox("Opponent", team_options, index=team_options.index(opp_default))
+# Opponent on sidebar (aligned with NBA app behavior)
+with st.sidebar:
+    opp_default = chart_gl["opponentAbbrev"].dropna().astype(str).iloc[0] if ("opponentAbbrev" in chart_gl.columns and not chart_gl.empty) else (TEAM_ABBRS[0])
+    opponent = st.selectbox("Opponent", TEAM_ABBRS, index=TEAM_ABBRS.index(opp_default) if opp_default in TEAM_ABBRS else 0, key="opponent_select")
 
-# Opponent metrics & adjusters (from club-stats only)
+# Opponent metrics & adjusters
 opp_ga_pg, opp_sa_pg, score_adj, shots_adj = opponent_metrics(opponent, SEASON, GAME_TYPE, league_sa_pg, league_ga_pg)
 
-# Header
+# Identity panel (matches NBA: name, age, pos, seasons, current-season GP)
 col1, col2 = st.columns([2,1])
 with col1:
     full_name = bio.get("fullName") or player_name
     age = bio.get("age", "—")
     pos = bio.get("positionCode", position_code)
     seasons_played = len(season_totals["seasonId"].unique()) if not season_totals.empty and "seasonId" in season_totals.columns else "—"
-    # current season GP (from seasonTotals if present)
     gp_cur = "—"
     if not season_totals.empty and {"seasonId","gamesPlayed"}.issubset(season_totals.columns):
         row = season_totals.loc[season_totals["seasonId"] == SEASON]
@@ -341,68 +363,80 @@ with col2:
     st.markdown(f"**Opponent:** {opponent}")
     if np.isfinite(opp_ga_pg) and np.isfinite(opp_sa_pg):
         st.markdown(f"GA/GP: **{opp_ga_pg:.2f}**  •  SA/GP: **{opp_sa_pg:.2f}**")
-        st.caption(f"League baselines — GA/GP: {league_ga_pg:.2f} • SA/GP: {league_sa_pg:.2f}")
-    else:
-        st.markdown("Opponent metrics unavailable (using neutral adjusters).")
-        st.caption(f"League baselines — GA/GP: {league_ga_pg:.2f} • SA/GP: {league_sa_pg:.2f}")
+    st.caption(f"League baselines — GA/GP: {league_ga_pg:.2f} • SA/GP: {league_sa_pg:.2f}")
 
 st.markdown("---")
 
-# Projections
-is_goalie = (pos == "G")
-if is_goalie:
-    proj = goalie_projection(gl, season_totals, w_recent, w_season, w_career, shots_adj, K=recent_window)
-else:
-    proj = skater_projection(gl, season_totals, w_recent, w_season, w_career, shots_adj, score_adj, K=recent_window)
-
-st.subheader("Projection Summary")
-st.table(proj.set_index("Stat"))
-
-# Recent trends
+# Recent trends (charts)
 st.subheader("Recent Trends")
-if gl.empty:
-    st.info("No game logs available to chart.")
+if chart_gl.empty:
+    st.info("No recent game logs to chart.")
 else:
     plot_cols = []
+    is_goalie = (pos == "G")
+    df_plot = chart_gl.copy()
     if is_goalie:
-        if "shotsAgainst" in gl.columns: plot_cols.append(("shotsAgainst","Shots Against"))
-        if "saves" in gl.columns:        plot_cols.append(("saves","Saves"))
+        # Robust goalie columns
+        if any(c in df_plot.columns for c in ["shotsAgainst","shots"]):
+            plot_cols.append( ( "shotsAgainst" if "shotsAgainst" in df_plot.columns else "shots", "Shots Against" ) )
+        if any(c in df_plot.columns for c in ["saves","sv"]):
+            plot_cols.append( ( "saves" if "saves" in df_plot.columns else "sv", "Saves" ) )
     else:
-        tmp = gl.copy()
-        tmp["PTS"] = pd.to_numeric(tmp.get("goals",0), errors="coerce").fillna(0) + pd.to_numeric(tmp.get("assists",0), errors="coerce").fillna(0)
-        gl = tmp
-        for c, label in [("PTS","Points"),("goals","Goals"),("assists","Assists"),("shots","Shots on Goal")]:
-            if c in gl.columns: plot_cols.append((c,label))
+        df_plot["PTS"] = pd.to_numeric(df_plot.get("goals",0), errors="coerce").fillna(0) + pd.to_numeric(df_plot.get("assists",0), errors="coerce").fillna(0)
+        for c, label in [("PTS","Points"),("goals","Goals"),("assists","Assists"),("shots","Shots on Goal"),("shotsOnGoal","Shots on Goal")]:
+            if c in df_plot.columns:
+                # avoid duplicate shots labels if both present
+                if c in ["shotsOnGoal"] and "shots" in df_plot.columns:
+                    continue
+                plot_cols.append((c,label))
 
-    plot_df = gl.head(min(len(gl), recent_window*2)).iloc[::-1]
+    # Limit to 2x recent window for cleaner viz
+    df_plot = df_plot.head(min(len(df_plot), recent_window*2)).iloc[::-1]  # chronological
     for c, label in plot_cols:
-        if c not in plot_df.columns: continue
-        fig = px.line(plot_df, x="gameDate", y=c, markers=True, title=label)
+        fig = px.line(df_plot, x="gameDate", y=c, markers=True, title=label)
         fig.update_layout(height=300, margin=dict(l=10,r=10,t=40,b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-# Last 5 games (whole numbers for single-game stats)
+# Projections
+st.subheader("Projection Summary")
+is_goalie = (pos == "G")
+if is_goalie:
+    proj = goalie_projection(gl if not gl.empty else chart_gl, season_totals, w_recent, w_season, w_career, shots_adj, K=recent_window)
+else:
+    proj = skater_projection(gl if not gl.empty else chart_gl, season_totals, w_recent, w_season, w_career, shots_adj, score_adj, K=recent_window)
+st.table(proj.set_index("Stat"))
+
+# Last 5 games (current selected season fallback already handled for charts; here show selected season if available)
 st.subheader(f"Last 5 Games — {str(SEASON)[:4]}-{str(SEASON)[4:]}")
-if gl.empty:
+table_df = gl.copy()
+if table_df.empty:
     st.info("No games this season/selection.")
 else:
-    last5 = gl.sort_values("gameDate", ascending=False).head(5).copy()
+    last5 = table_df.sort_values("gameDate", ascending=False).head(5).copy()
     if not is_goalie:
         last5["PTS"] = pd.to_numeric(last5.get("goals",0), errors="coerce").fillna(0) + pd.to_numeric(last5.get("assists",0), errors="coerce").fillna(0)
         meta = ["gameDate","teamAbbrev","opponentAbbrev","homeRoad"]
-        stats = ["PTS","goals","assists","shots"]
-        cols  = [c for c in meta + stats if c in last5.columns]
-        ints  = [c for c in stats if c in cols]
-        st.dataframe(last5[cols].style.format({c:"{:.0f}" for c in ints}), use_container_width=True, height=auto_height(last5[cols]))
-        avg = last5[stats].mean(numeric_only=True).to_frame().T.round(2); avg.index=["Average (Last 5)"]
+        stats = ["PTS","goals","assists","shots","shotsOnGoal"]
+        # prefer 'shots' if both exist
+        if "shots" not in last5.columns and "shotsOnGoal" in last5.columns:
+            last5["shots"] = last5["shotsOnGoal"]
+        cols  = [c for c in meta + ["PTS","goals","assists","shots"] if c in last5.columns]
+        st.dataframe(last5[cols].style.format({c:"{:.0f}" for c in ["PTS","goals","assists","shots"] if c in cols}),
+                     use_container_width=True, height=auto_height(last5[cols]))
+        avg = last5[["PTS","goals","assists","shots"]].mean(numeric_only=True).to_frame().T.round(2); avg.index=["Average (Last 5)"]
         st.table(avg)
     else:
+        # goalie
         meta = ["gameDate","teamAbbrev","opponentAbbrev","homeRoad"]
-        stats = ["shotsAgainst","saves"]
-        cols  = [c for c in meta + stats if c in last5.columns]
-        ints  = [c for c in stats if c in cols]
-        st.dataframe(last5[cols].style.format({c:"{:.0f}" for c in ints}), use_container_width=True, height=auto_height(last5[cols]))
-        avg = last5[stats].mean(numeric_only=True).to_frame().T.round(2); avg.index=["Average (Last 5)"]
+        # normalize field names to display
+        if "shots" in last5.columns and "shotsAgainst" not in last5.columns:
+            last5["shotsAgainst"] = last5["shots"]
+        if "sv" in last5.columns and "saves" not in last5.columns:
+            last5["saves"] = last5["sv"]
+        cols = [c for c in meta + ["shotsAgainst","saves"] if c in last5.columns]
+        st.dataframe(last5[cols].style.format({"shotsAgainst":"{:.0f}","saves":"{:.0f}"}),
+                     use_container_width=True, height=auto_height(last5[cols]))
+        avg = last5[["shotsAgainst","saves"]].mean(numeric_only=True).to_frame().T.round(2); avg.index=["Average (Last 5)"]
         st.table(avg)
 
 # Last 5 vs Opponent (cross-season)
@@ -413,18 +447,24 @@ if vs.empty:
 else:
     if not is_goalie:
         vs["PTS"] = pd.to_numeric(vs.get("goals",0), errors="coerce").fillna(0) + pd.to_numeric(vs.get("assists",0), errors="coerce").fillna(0)
+        if "shots" not in vs.columns and "shotsOnGoal" in vs.columns:
+            vs["shots"] = vs["shotsOnGoal"]
         meta = ["gameDate","teamAbbrev","opponentAbbrev","homeRoad"]
-        stats = ["PTS","goals","assists","shots"]
-        cols  = [c for c in meta + stats if c in vs.columns]
+        cols = [c for c in meta + ["PTS","goals","assists","shots"] if c in vs.columns]
         vs = vs.sort_values("gameDate", ascending=False)
-        st.dataframe(vs[cols].style.format({c:"{:.0f}" for c in stats if c in cols}), use_container_width=True, height=auto_height(vs[cols]))
-        avg_vs = vs[stats].mean(numeric_only=True).to_frame().T.round(2); avg_vs.index=["Average (vs Opp)"]
+        st.dataframe(vs[cols].style.format({c:"{:.0f}" for c in ["PTS","goals","assists","shots"] if c in cols}),
+                     use_container_width=True, height=auto_height(vs[cols]))
+        avg_vs = vs[["PTS","goals","assists","shots"]].mean(numeric_only=True).to_frame().T.round(2); avg_vs.index=["Average (vs Opp)"]
         st.table(avg_vs)
     else:
+        if "shots" in vs.columns and "shotsAgainst" not in vs.columns:
+            vs["shotsAgainst"] = vs["shots"]
+        if "sv" in vs.columns and "saves" not in vs.columns:
+            vs["saves"] = vs["sv"]
         meta = ["gameDate","teamAbbrev","opponentAbbrev","homeRoad"]
-        stats = ["shotsAgainst","saves"]
-        cols  = [c for c in meta + stats if c in vs.columns]
+        cols = [c for c in meta + ["shotsAgainst","saves"] if c in vs.columns]
         vs = vs.sort_values("gameDate", ascending=False)
-        st.dataframe(vs[cols].style.format({c:"{:.0f}" for c in stats if c in cols}), use_container_width=True, height=auto_height(vs[cols]))
-        avg_vs = vs[stats].mean(numeric_only=True).to_frame().T.round(2); avg_vs.index=["Average (vs Opp)"]
+        st.dataframe(vs[cols].style.format({"shotsAgainst":"{:.0f}","saves":"{:.0f}"}),
+                     use_container_width=True, height=auto_height(vs[cols]))
+        avg_vs = vs[["shotsAgainst","saves"]].mean(numeric_only=True).to_frame().T.round(2); avg_vs.index=["Average (vs Opp)"]
         st.table(avg_vs)
