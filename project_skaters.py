@@ -100,6 +100,13 @@ def project_skaters() -> pd.DataFrame:
     recent_years = [target - 1, target - 2, target - 3]
     pool = hist[hist["mp_season_year"].isin(recent_years)].copy()
 
+    # Current-season team from the published roster (captures trades / FA moves that
+    # the prior-season stats, tied to the OLD team, cannot). + season SOS factor.
+    import context as ctx
+    roster = dl.load_rosters(target)
+    cur_team = dict(zip(roster["playerId"], roster["team"]))
+    sos = ctx.schedule_context(target).groupby("team")["sos_factor"].first().to_dict()
+
     rows = []
     for pid, g in pool.groupby("playerId"):
         g = g.sort_values("mp_season_year")
@@ -122,7 +129,13 @@ def project_skaters() -> pd.DataFrame:
         mean_age = np.average(g["age"], weights=g["blend_w"])
         target_age = mean_age + (target - np.average(g["mp_season_year"], weights=g["blend_w"]))
 
-        proj = {"playerId": pid, "name": latest["name"], "team": latest["team"],
+        # Team for the UPCOMING season: prefer the published roster; fall back to the
+        # last team the player appeared for. `on_roster` flags whether the player is
+        # actually rostered for the target season (vs. projected-but-unsigned).
+        team = cur_team.get(pid, latest["team"])
+        on_roster = pid in cur_team
+        proj = {"playerId": pid, "name": latest["name"], "team": team,
+                "prior_team": latest["team"], "on_roster": on_roster,
                 "position": latest["position"], "pos_group": pos_group,
                 "target_age": round(target_age, 1)}
 
@@ -145,10 +158,16 @@ def project_skaters() -> pd.DataFrame:
         proj_gp = _project_gp(g)
         proj_toi = toi_per_gp * proj_gp
 
+        # Season strength-of-schedule factor for the player's target-season team.
+        # This is the genuine, non-zero-sum shift from an unbalanced (divisional)
+        # schedule; it is tiny for skaters (~<1%) by design and by the data.
+        sos_factor = sos.get(team, 1.0)
+
         proj["proj_gp"] = round(proj_gp, 1)
         proj["proj_toi_per_gp"] = round(toi_per_gp, 2)
+        proj["sos_factor"] = round(sos_factor, 4)
         for stat in RATE_STATS:
-            total = proj_rate[stat] * proj_toi / 60.0
+            total = proj_rate[stat] * proj_toi / 60.0 * sos_factor
             proj[f"proj_{stat}"] = round(total, 1)
         rows.append(proj)
 

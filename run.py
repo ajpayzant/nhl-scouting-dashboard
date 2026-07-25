@@ -19,6 +19,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true", help="re-download all source data")
     ap.add_argument("--backtest", action="store_true", help="run accuracy backtest")
+    ap.add_argument("--games", action="store_true", help="also write game-by-game projections")
     args = ap.parse_args()
 
     if args.refresh:
@@ -26,8 +27,11 @@ def main():
         dl.load_moneypuck_skaters(refresh=True)
         dl.load_moneypuck_skaters_pp(refresh=True)
         dl.load_moneypuck_goalies(refresh=True)
+        dl.load_moneypuck_teams(refresh=True)
         dl.load_nhl_skater_bios(refresh=True)
         dl.load_nhl_goalie_summary(refresh=True)
+        dl.load_rosters(refresh=True)
+        dl.load_schedule(refresh=True)
 
     print(f"\n=== Skater projections for {C.TARGET_SEASON}-{C.TARGET_SEASON+1} ===")
     sk = ps.project_skaters()
@@ -44,6 +48,14 @@ def main():
     print(f"{len(g)} goalies -> {g_path}")
     print(g[["name", "team", "proj_gp", "proj_wins", "proj_save_pct",
              "proj_gaa"]].head(10).to_string(index=False))
+
+    if args.games:
+        import project_games as pgm
+        print(f"\n=== Game-by-game skater projections ===")
+        games = pgm.project_games(season_proj=sk)
+        gpath = C.OUTPUT / f"skater_game_projections_{C.TARGET_SEASON}.csv"
+        games.to_csv(gpath, index=False, encoding="utf-8-sig")
+        print(f"{len(games)} game rows ({games['playerId'].nunique()} players) -> {gpath}")
 
     if args.backtest:
         print("\n=== Backtest ===")

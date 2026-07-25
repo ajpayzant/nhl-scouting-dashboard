@@ -53,6 +53,14 @@ def project_goalies() -> pd.DataFrame:
     pool = hist[hist["mp_season_year"].isin(recent_years)].copy()
     wmap = dict(zip(recent_years, C.GP_RECENCY_WEIGHTS))
 
+    # Current-season team + team strength. For goalies, team context is FIRST-ORDER:
+    # a strong-defense team suppresses shots-against (fewer saves, better GAA) and lifts
+    # the win rate. We apply the NEW team's ratings, not the goalie's prior team.
+    import context as ctx
+    roster = dl.load_rosters(target)
+    cur_team = dict(zip(roster["playerId"], roster["team"]))
+    ratings = ctx.team_defense_ratings().set_index("team")
+
     rows = []
     for pid, g in pool.groupby("playerId"):
         g = g.sort_values("mp_season_year")
@@ -73,14 +81,27 @@ def project_goalies() -> pd.DataFrame:
         blended_gp = np.average(g["gamesPlayed"], weights=gp_w)
         proj_gp = float(np.clip(0.75 * blended_gp + 0.25 * 40.0, 1, 70))
 
-        # Shots against per game: recent workload, lightly regressed to league.
+        # Team context for the UPCOMING season (first-order for goalies).
+        team = cur_team.get(pid, latest["teamAbbrevs"])
+        on_roster = pid in cur_team
+        # Use the first listed team abbrev if the goalie was traded mid-history.
+        team_key = str(team).split(",")[0]
+        def_rating = ratings.loc[team_key, "def_rating"] if team_key in ratings.index else 1.0
+
+        # Shots against per game: recent workload blended toward what THIS team's defense
+        # allows. A strong defense (def_rating>1) suppresses shots faced.
         blended_sa = np.average(g["sa_per_gp"], weights=g["rec_w"] * g["gamesPlayed"])
-        proj_sa_gp = 0.7 * blended_sa + 0.3 * lg_sa_gp
+        team_sa_gp = lg_sa_gp / def_rating  # strong D => fewer shots against
+        # 60% the goalie's own recent workload, 40% the new team's shot-suppression profile.
+        proj_sa_gp = 0.6 * blended_sa + 0.4 * team_sa_gp
         proj_shots = proj_sa_gp * proj_gp
 
-        # Win rate per game: recent, regressed to 0.5-ish start-neutral prior.
+        # Win rate per game: recent form, regressed toward a start-neutral prior, then
+        # nudged by team quality (better team => more wins independent of the goalie).
         blended_wr = np.average(g["win_rate"], weights=g["rec_w"] * g["gamesPlayed"])
         proj_wr = (blended_wr * total_shots + 0.42 * 1500.0) / (total_shots + 1500.0)
+        team_quality = (ratings.loc[team_key, "off_rating"] * def_rating) if team_key in ratings.index else 1.0
+        proj_wr = float(np.clip(proj_wr * (0.5 + 0.5 * team_quality), 0.05, 0.85))
 
         # Shutout rate scales with save quality vs league.
         blended_so = np.average(g["so_rate"], weights=g["rec_w"] * g["gamesPlayed"])
@@ -93,7 +114,9 @@ def project_goalies() -> pd.DataFrame:
         rows.append({
             "playerId": pid,
             "name": latest["goalieFullName"],
-            "team": latest["teamAbbrevs"],
+            "team": team_key,
+            "prior_team": latest["teamAbbrevs"],
+            "on_roster": on_roster,
             "proj_gp": round(proj_gp, 1),
             "proj_wins": round(proj_wr * proj_gp, 1),
             "proj_save_pct": round(proj_sv, 4),

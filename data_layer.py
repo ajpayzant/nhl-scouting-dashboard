@@ -174,6 +174,154 @@ def load_nhl_goalie_summary(refresh: bool = False) -> pd.DataFrame:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Current-season structural data: teams, rosters, schedule (api-web)          #
+# --------------------------------------------------------------------------- #
+def active_teams(season: int = C.TARGET_SEASON, refresh: bool = False) -> list[str]:
+    """The 32 teams active in the target season (derived from a mid-season game day)."""
+    cache = C.DATA_RAW / f"active_teams_{season}.json"
+    if cache.exists() and not refresh:
+        import json
+        return json.loads(cache.read_text())
+    resp = _get(C.NHL_DAY_SCHEDULE.format(date=C.TARGET_SEASON_SAMPLE_DATE))
+    teams = set()
+    for wk in resp.json().get("gameWeek", []):
+        for g in wk.get("games", []):
+            teams.add(g["awayTeam"]["abbrev"])
+            teams.add(g["homeTeam"]["abbrev"])
+    out = sorted(teams)
+    import json
+    cache.write_text(json.dumps(out))
+    return out
+
+
+def load_rosters(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.DataFrame:
+    """Current published roster for every active team in `season`.
+
+    This is how we know a player's team for the UPCOMING season (captures trades /
+    free-agent moves that season-summary stats, tied to the prior team, cannot).
+    One row per (playerId, team). Columns: playerId, team, positionCode, fullName, ...
+    """
+    cache = C.DATA_RAW / f"rosters_{season}.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+
+    sid = C.season_id(season)
+    rows = []
+    for team in active_teams(season, refresh=refresh):
+        try:
+            resp = _get(C.NHL_ROSTER.format(team=team, season_id=sid))
+        except requests.HTTPError as e:
+            print(f"  [skip] roster {team}: {e}")
+            continue
+        data = resp.json()
+        for grp, grp_pos in (("forwards", "F"), ("defensemen", "D"), ("goalies", "G")):
+            for p in data.get(grp, []):
+                rows.append({
+                    "playerId": p["id"],
+                    "team": team,
+                    "roster_group": grp_pos,
+                    "positionCode": p.get("positionCode"),
+                    "fullName": f"{p.get('firstName', {}).get('default', '')} "
+                                f"{p.get('lastName', {}).get('default', '')}".strip(),
+                    "birthDate": p.get("birthDate"),
+                    "shootsCatches": p.get("shootsCatches"),
+                })
+        print(f"  roster {team}: {len(data.get('forwards', []))}F "
+              f"{len(data.get('defensemen', []))}D {len(data.get('goalies', []))}G")
+        time.sleep(C.REQUEST_PAUSE)
+    out = pd.DataFrame(rows)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def load_schedule(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.DataFrame:
+    """Full regular-season schedule for `season`: one row per team per game.
+
+    Long format (each game appears twice, once per team) so per-team opponent /
+    home-away / rest can be computed directly. gameType 2 = regular season.
+    """
+    cache = C.DATA_RAW / f"schedule_{season}.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+
+    sid = C.season_id(season)
+    seen_games = set()
+    rows = []
+    for team in active_teams(season, refresh=refresh):
+        try:
+            resp = _get(C.NHL_CLUB_SCHEDULE.format(team=team, season_id=sid))
+        except requests.HTTPError as e:
+            print(f"  [skip] schedule {team}: {e}")
+            continue
+        for g in resp.json().get("games", []):
+            if g.get("gameType") != 2:
+                continue
+            gid = g["id"]
+            home = g["homeTeam"]["abbrev"]
+            away = g["awayTeam"]["abbrev"]
+            for side, opp, is_home in ((home, away, True), (away, home, False)):
+                rows.append({
+                    "gameId": gid, "gameDate": g["gameDate"], "season": season,
+                    "team": side, "opponent": opp, "is_home": is_home,
+                    "neutralSite": g.get("neutralSite", False),
+                })
+            seen_games.add(gid)
+        time.sleep(C.REQUEST_PAUSE)
+    out = pd.DataFrame(rows).drop_duplicates(["gameId", "team"])
+    out = out.sort_values(["team", "gameDate"]).reset_index(drop=True)
+    print(f"  schedule {season}: {len(seen_games)} unique games, "
+          f"{out.groupby('team').size().median():.0f} games/team (median)")
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def load_moneypuck_lines(refresh: bool = False) -> pd.DataFrame:
+    """5on5 line/pairing combinations per history season (line-chemistry context).
+
+    `lineId` is the players' NHL ids concatenated (7 digits each): a 14-digit id is a
+    defense pairing, a 21-digit id is a forward line. Carries xG%/Corsi%/TOI per unit.
+    """
+    cache = C.DATA_RAW / "mp_lines.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    frames = []
+    for yr in C.HISTORY_SEASONS:
+        try:
+            df = _moneypuck_csv(C.MONEYPUCK_LINES, yr)
+        except requests.HTTPError:
+            continue
+        df = df[df["situation"] == "5on5"].copy()
+        frames.append(df)
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def load_moneypuck_teams(refresh: bool = False) -> pd.DataFrame:
+    """All-situation team offense/defense summaries per history season (SOS ratings)."""
+    cache = C.DATA_RAW / "mp_teams.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    frames = []
+    for yr in C.HISTORY_SEASONS:
+        try:
+            df = _moneypuck_csv(C.MONEYPUCK_TEAMS, yr)
+        except requests.HTTPError:
+            continue
+        df = df[df["situation"] == "all"].copy()
+        frames.append(df)
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def split_line_ids(line_id) -> list[int]:
+    """Decompose a MoneyPuck lineId into its 7-digit NHL player ids."""
+    s = str(int(line_id))
+    return [int(s[i:i + 7]) for i in range(0, len(s), 7)]
+
+
 def player_birthdates(bios: pd.DataFrame) -> pd.DataFrame:
     """Collapse bios to one birthDate + latest position per playerId."""
     b = bios.dropna(subset=["birthDate"]).copy()
