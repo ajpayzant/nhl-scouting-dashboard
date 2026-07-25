@@ -1,0 +1,7 @@
+# Cached source data (rebuildable via `python run.py --refresh`)
+data/raw/*.parquet
+data/processed/*
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
