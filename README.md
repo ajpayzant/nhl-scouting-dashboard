@@ -12,13 +12,40 @@ python run.py --refresh     # first run: download + cache all source data
 python run.py               # subsequent runs: use cached data
 python run.py --games       # also write game-by-game projections
 python run.py --backtest    # also print the accuracy backtest
+python build_workbook.py    # build the interactive Google-Sheets workbook (.xlsx)
 ```
 
+### Interactive workbook (Google Sheets)
+
+`build_workbook.py` turns the projection CSVs into `output/NHL_Projections_2026.xlsx` — a
+multi-tab workbook you upload to Google Drive and open with Google Sheets (tabs, the
+player dropdown, INDEX/MATCH formulas, filters and color scales all import intact):
+
+- **Overview & Dictionary** — how the model works + every abbreviation
+- **Dashboard** — pick any player from a dropdown; see their projected line beside their
+  actual stats from the last three seasons
+- **All Skaters** / **All Goalies** — every rostered player, sortable/filterable, heat-mapped
+- **One tab per team** — that team's projected skaters and goalies
+
+Run `python run.py` first so the CSVs are current, then `python build_workbook.py`.
+
 Outputs land in `output/`:
-- `skater_projections_2026.csv` — G / A / points / shots / PP points + projected GP & TOI/GP
-- `goalie_projections_2026.csv` — W / SV% / GAA / saves / shutouts + projected GP
+- `skater_projections_2026.csv` — G / A / points / shots / PP points + projected GP & TOI/GP,
+  plus a `_p10`/`_p90` floor/ceiling band for EVERY counting stat (goals, assists, points,
+  shots, PP points) and `gp_reliability`/`gp_override` flags
+- `goalie_projections_2026.csv` — W / SV% / GAA / saves / shutouts + projected GP,
+  plus `wins_p10`/`wins_p90` and `save_pct_p10`/`save_pct_p90` (floor/ceiling bands)
 - `skater_game_projections_2026.csv` — one row per player per scheduled game, with
   matchup/home-away/rest-adjusted expected stats that sum back to the season total
+
+### Manually overriding games played
+
+Games played is the single largest source of season-total error and is near-random to
+predict (injuries). If you *know* a player's status (a confirmed injury, a return date,
+load management), set it in **`gp_overrides.csv`** — one row per player, fill either
+`playerId` or the exact `name`, plus `games_played` (0-84). An override replaces the
+model's GP for that player, rescales their season totals, and (being a known quantity)
+tightens their prediction interval. The file ships as an empty commented template.
 
 ## Data sources (all free, no API key)
 

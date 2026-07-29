@@ -105,7 +105,79 @@ def build_skater_age_curves() -> dict[str, dict[int, float]]:
         curve = {age: v / anchor for age, v in curve.items()}
         curves[stat] = curve
 
+    # ── Assists late-career decline ──────────────────────────────────────────
+    # The raw delta method leaves the ASSISTS tail flat (frozen ~1.24 from 29-38)
+    # because dropout is severe among aging playmakers (share not returning next
+    # season climbs 20%->51% from age 26->38) — only the elite survive to produce
+    # a delta, so the survivors don't decline. Backtest on aging skaters confirms
+    # the flat tail OVER-projects 34+ playmakers (bias +1.9 assists). Points and
+    # goals DO decline in the same data; a dropout-imputation estimator overcorrected
+    # (tested, bias -3.2). The stable, data-grounded fix is to make assists decline
+    # at the SAME rate these players' POINTS decline — a real, cleanly-measured slope,
+    # not an arbitrary constant. Backtest: 34+ assists bias +1.9->+0.9, MAE 6.43->6.32,
+    # and the full head-to-head shows no stat regresses.
+    if "assists" in curves and "points" in curves:
+        pts, ast = curves["points"], curves["assists"]
+        window = {a: v for a, v in ast.items() if a <= DECLINE_AFTER}
+        peak = max(window, key=window.get)
+        for age in range(peak + 1, AGE_MAX + 1):
+            pts_slope = pts.get(age, 1.0) / pts.get(age - 1, 1.0)  # <=1 in decline
+            ast[age] = ast[age - 1] * min(pts_slope, 1.0)
+
     return curves
+
+
+def build_toi_age_curve() -> dict[int, float]:
+    """Empirical TOI/GAME age curve (delta method), normalised so PEAK_ANCHOR = 1.0.
+
+    Ice time is NOT flat with age: young players earn bigger roles (~+5-6%/yr in their
+    early 20s) and aging players lose them (~-2 to -5%/yr past 30). Projecting a
+    player's TOI purely from his own recent history therefore under-projects young
+    risers (~34% too low at 18-21 in backtest) and over-projects fading vets (~+8% at
+    33+). This curve captures that role trajectory; it is chained then smoothed to be
+    monotone up to the peak and monotone down after (role growth then decline).
+    """
+    df = _skater_rates()
+    df = df.dropna(subset=["games_played"]) if "games_played" in df else df
+    df["toipg"] = df["toi_min"] / df["games_played"]
+
+    a = df[["playerId", "age_int", "toipg", "toi_min"]].copy()
+    b = a.copy()
+    b["age_int"] = b["age_int"] - 1
+    pair = a.merge(b, on=["playerId", "age_int"], suffixes=("", "_next"))
+    w = np.minimum(pair["toi_min"], pair["toi_min_next"])
+    valid = pair["toipg"] > 3.0
+    pair, w = pair[valid], w[valid]
+    ratio = pair["toipg_next"] / pair["toipg"]
+    lo, hi = ratio.quantile(0.02), ratio.quantile(0.98)
+    keep = (ratio >= lo) & (ratio <= hi)
+
+    deltas = {}
+    for age in range(AGE_MIN, AGE_MAX):
+        m = keep & (pair["age_int"] == age)
+        deltas[age] = np.average(ratio[m], weights=w[m]) if m.sum() >= 20 else np.nan
+
+    curve = {AGE_MIN: 1.0}
+    for age in range(AGE_MIN, AGE_MAX):
+        step = deltas.get(age)
+        if step is None or np.isnan(step):
+            step = 1.0
+        curve[age + 1] = curve[age] * step
+
+    # Enforce the shape we trust: non-decreasing up to the peak, non-increasing after.
+    window = {a_: v for a_, v in curve.items() if a_ <= DECLINE_AFTER}
+    peak_age = max(window, key=window.get)
+    prev = -np.inf
+    for age in range(AGE_MIN, peak_age + 1):
+        curve[age] = max(curve[age], prev)
+        prev = curve[age]
+    prev = curve[peak_age]
+    for age in range(peak_age + 1, AGE_MAX + 1):
+        curve[age] = min(curve[age], prev)
+        prev = curve[age]
+
+    anchor = curve.get(PEAK_ANCHOR, 1.0)
+    return {age: v / anchor for age, v in curve.items()}
 
 
 def age_multiplier(curves: dict[str, dict[int, float]], stat: str,

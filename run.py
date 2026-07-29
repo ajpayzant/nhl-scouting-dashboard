@@ -39,7 +39,10 @@ def main():
     sk.to_csv(sk_path, index=False, encoding="utf-8-sig")
     print(f"{len(sk)} skaters -> {sk_path}")
     print(sk[["name", "team", "position", "proj_gp", "proj_points",
-              "proj_goals", "proj_assists"]].head(10).to_string(index=False))
+              "points_p10", "points_p90", "proj_goals", "proj_assists"]].head(10).to_string(index=False))
+    n_ovr = int(sk["gp_override"].sum()) if "gp_override" in sk else 0
+    if n_ovr:
+        print(f"({n_ovr} projected with a manual games-played override)")
 
     print(f"\n=== Goalie projections for {C.TARGET_SEASON}-{C.TARGET_SEASON+1} ===")
     g = pg.project_goalies()

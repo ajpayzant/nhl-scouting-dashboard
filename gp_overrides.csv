@@ -1,0 +1,11 @@
+playerId,name,games_played
+# Manually override projected games played for the upcoming season.
+# One row per player. Fill EITHER playerId OR name (name must match exactly), plus
+# games_played (0-84). Lines starting with # are ignored. Delete the examples below.
+# Use this for known injuries, a confirmed return date, load management, etc. — games
+# played is the single biggest driver of season-total error, so a known status here
+# meaningfully sharpens the projection (and tightens its prediction interval).
+#
+# Examples:
+# 8478402,Connor McDavid,82
+# ,Sidney Crosby,80

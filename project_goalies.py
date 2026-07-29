@@ -51,7 +51,7 @@ def project_goalies() -> pd.DataFrame:
     lg_sa_gp = np.average(recent["sa_per_gp"], weights=recent["gamesPlayed"])
 
     pool = hist[hist["mp_season_year"].isin(recent_years)].copy()
-    wmap = dict(zip(recent_years, C.GP_RECENCY_WEIGHTS))
+    wmap = dict(zip(recent_years, C.GOALIE_RECENCY_WEIGHTS))
 
     # Current-season team + team strength. For goalies, team context is FIRST-ORDER:
     # a strong-defense team suppresses shots-against (fewer saves, better GAA) and lifts
@@ -76,10 +76,25 @@ def project_goalies() -> pd.DataFrame:
         k = C.GOALIE_REGRESS_SHOTS
         proj_sv = (blended_sv * total_shots + lg_svpct * k) / (total_shots + k)
 
-        # Games played: recency-weighted, regressed toward a starter/backup-neutral prior.
-        gp_w = g["rec_w"]
-        blended_gp = np.average(g["gamesPlayed"], weights=gp_w)
-        proj_gp = float(np.clip(0.75 * blended_gp + 0.25 * 40.0, 1, 70))
+        # Games played. Backtest showed the old flat 40-game prior + 70 cap squeezed the
+        # workload scale: workhorses under-projected ~17 GP, starters ~13, backups over
+        # ~11 — it didn't SEPARATE goalie roles. Fixes: (a) last season is the strongest
+        # signal (corr .56 vs .53 for a flat recency blend), so weight it 65%; (b) the
+        # prior itself scales with the goalie's start share (a proven starter regresses
+        # toward a starter's workload ~58, a backup toward ~26), which separates
+        # elite/starter/committee/backup; (c) lighter regression (own 85%); (d) scale to
+        # the 84-game season and lift the cap to 76.
+        g_desc = g.sort_values("mp_season_year", ascending=False)
+        gp_by_year = dict(zip(g_desc["mp_season_year"], g_desc["gamesPlayed"]))
+        gp_weights = [0.65, 0.22, 0.13]
+        num = den = 0.0
+        for i, yr in enumerate(sorted(gp_by_year, reverse=True)[:3]):
+            num += gp_weights[i] * gp_by_year[yr]; den += gp_weights[i]
+        blended_gp = num / den
+        start_share = np.average(g["start_share"], weights=g["rec_w"] * g["gamesPlayed"])
+        gp_prior = 26.0 + 32.0 * float(np.clip(start_share, 0, 1))  # backup ~26 .. starter ~58
+        proj_gp = (0.85 * blended_gp + 0.15 * gp_prior) * (C.SEASON_GAMES / 82.0)
+        proj_gp = float(np.clip(proj_gp, 1, 76))
 
         # Team context for the UPCOMING season (first-order for goalies).
         team = cur_team.get(pid, latest["teamAbbrevs"])
@@ -98,8 +113,11 @@ def project_goalies() -> pd.DataFrame:
 
         # Win rate per game: recent form, regressed toward a start-neutral prior, then
         # nudged by team quality (better team => more wins independent of the goalie).
+        # Wins are the noisiest, most team-driven goalie stat, so regress the win rate
+        # hard toward a start-neutral 0.42. Backtest (review_goalies section D) confirmed a
+        # heavier prior helps: win MAE 6.64@1500 -> 6.60@2500 (4000 barely better, 6.58).
         blended_wr = np.average(g["win_rate"], weights=g["rec_w"] * g["gamesPlayed"])
-        proj_wr = (blended_wr * total_shots + 0.42 * 1500.0) / (total_shots + 1500.0)
+        proj_wr = (blended_wr * total_shots + 0.42 * 2500.0) / (total_shots + 2500.0)
         team_quality = (ratings.loc[team_key, "off_rating"] * def_rating) if team_key in ratings.index else 1.0
         proj_wr = float(np.clip(proj_wr * (0.5 + 0.5 * team_quality), 0.05, 0.85))
 
@@ -127,14 +145,36 @@ def project_goalies() -> pd.DataFrame:
         })
 
     out = pd.DataFrame(rows).sort_values("proj_wins", ascending=False).reset_index(drop=True)
+    _add_prediction_intervals(out)
     return out
+
+
+# Empirically-calibrated goalie interval widths (backtest 2022-25, 293 goalie-seasons).
+# WINS behave like count data: residual std ~ sqrt(proj_wins), and unlike skaters the
+# normalized std is uniform across workload (start_share doesn't separate goalies who
+# play enough to project), so a single coefficient suffices. coef 2.2 at +-1.28 std
+# gives ~82% coverage of an 80% target. SV% is a bounded, roughly homoscedastic rate:
+# a flat additive std of 0.0151 gives ~79% coverage. p10/p90 (80% band) matches skaters.
+PI_WINS_COEF = 2.2
+PI_SVPCT_STD = 0.0151
+_PI_Z = 1.2816  # 80% central interval
+
+
+def _add_prediction_intervals(out: pd.DataFrame) -> None:
+    """Add p10/p90 floor/ceiling bands for wins and save percentage, in place."""
+    w_std = PI_WINS_COEF * np.sqrt(out["proj_wins"].clip(lower=2.0))
+    out["wins_p10"] = (out["proj_wins"] - _PI_Z * w_std).clip(lower=0).round(1)
+    out["wins_p90"] = (out["proj_wins"] + _PI_Z * w_std).round(1)
+    sv_half = _PI_Z * PI_SVPCT_STD
+    out["save_pct_p10"] = (out["proj_save_pct"] - sv_half).clip(lower=0).round(4)
+    out["save_pct_p90"] = (out["proj_save_pct"] + sv_half).clip(upper=1.0).round(4)
 
 
 if __name__ == "__main__":
     out = project_goalies()
     print(f"Projected {len(out)} goalies for {C.TARGET_SEASON}-{C.TARGET_SEASON+1}\n")
-    cols = ["name", "team", "proj_gp", "proj_wins", "proj_save_pct",
-            "proj_gaa", "proj_saves", "proj_shutouts"]
+    cols = ["name", "team", "proj_gp", "proj_wins", "wins_p10", "wins_p90",
+            "proj_save_pct", "save_pct_p10", "save_pct_p90", "proj_gaa", "proj_shutouts"]
     print(out[cols].head(25).to_string(index=False))
     path = C.OUTPUT / f"goalie_projections_{C.TARGET_SEASON}.csv"
     out.to_csv(path, index=False, encoding="utf-8-sig")

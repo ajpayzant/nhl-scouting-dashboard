@@ -38,18 +38,41 @@ def _seasons_frame() -> pd.DataFrame:
     return df
 
 
-def backtest_season(df: pd.DataFrame, curves: dict, target: int) -> pd.DataFrame:
-    recent_years = [target - 1, target - 2, target - 3]
+def backtest_season(df: pd.DataFrame, curves: dict, target: int,
+                    toi_curve: dict | None = None) -> pd.DataFrame:
+    if toi_curve is None:
+        toi_curve = ac.build_toi_age_curve()
+    # Match production: N-season history window (N = len(RECENCY_WEIGHTS)).
+    recent_years = [target - i for i in range(1, C.SKATER_HISTORY_SEASONS + 1)]
     hist = df[df["mp_season_year"].isin(recent_years)]
     actual = df[df["mp_season_year"] == target][
         ["playerId", "points", "pts_per60", "toi_min", "games_played"]
     ].rename(columns={"points": "act_points", "pts_per60": "act_rate",
                       "toi_min": "act_toi", "games_played": "act_gp"})
 
-    # Positional mean rate from the pre-target window.
-    pm = hist.groupby("pos_group").apply(
-        lambda g: np.average(g["pts_per60"], weights=g["toi_min"]), include_groups=False
-    ).to_dict()
+    # Regression targets by position group AND usage tier (TOI/game quartile) — mirrors
+    # production project_skaters._positional_means/_tier_target so the backtest reflects
+    # the real model: a top-line skater regresses toward top-line rates, not the global
+    # positional mean (which includes 4th-liners and under-projects stars).
+    h = hist.copy()
+    h["toipg"] = h["toi_min"] / h["games_played"]
+    pm = {}          # global positional mean rate (fallback)
+    tier_q = {}      # TOI/game quartile breakpoints per position
+    tier_mean = {}   # {pos_group: {tier: mean_rate}}
+    for grp, gg in h.groupby("pos_group"):
+        pm[grp] = np.average(gg["pts_per60"], weights=gg["toi_min"])
+        qs = gg["toipg"].quantile([0.25, 0.50, 0.75]).to_numpy()
+        tier_q[grp] = qs
+        tier_mean[grp] = {}
+        tier = np.searchsorted(qs, gg["toipg"].to_numpy())
+        for t in range(4):
+            sub = gg[tier == t]
+            if len(sub) >= 20:
+                tier_mean[grp][t] = np.average(sub["pts_per60"], weights=sub["toi_min"])
+
+    def _target(grp: float, toipg: float) -> float:
+        t = int(np.searchsorted(tier_q[grp], toipg))
+        return tier_mean[grp].get(t, pm[grp])
 
     wmap = dict(zip(recent_years, C.RECENCY_WEIGHTS))
     rows = []
@@ -63,20 +86,26 @@ def backtest_season(df: pd.DataFrame, curves: dict, target: int) -> pd.DataFrame
             continue
         total_toi = g["toi_min"].sum()
 
+        sample_toipg = np.average(g["toi_min"] / g["games_played"], weights=g["blend_w"])
         blended_rate = np.average(g["pts_per60"], weights=g["blend_w"])
         k = C.SKATER_REGRESS_TOI_MIN
-        regressed = (blended_rate * total_toi + pm[pos_group] * k) / (total_toi + k)
+        target_rate = _target(pos_group, sample_toipg)
+        regressed = (blended_rate * total_toi + target_rate * k) / (total_toi + k)
 
         mean_age = np.average(g["age"], weights=g["blend_w"])
         target_age = mean_age + (target - np.average(g["mp_season_year"], weights=g["blend_w"]))
         mult = ac.age_multiplier(curves, "points", mean_age, target_age)
         model_rate = regressed * mult
 
-        # Volume projection (same as production).
+        # Volume projection (same as production): recency-blended TOI/game, age-trended.
+        # Production uses SKATER_TOI_PRIOR_MIN=0 (no tier prior on TOI), i.e. the raw
+        # recency-blended own TOI — which is exactly this.
         toi_per_gp = np.average(g["toi_min"] / g["games_played"], weights=g["blend_w"])
+        toi_per_gp *= ac.age_multiplier({"toi": toi_curve}, "toi", mean_age, target_age)
         gp = dict(zip(g["mp_season_year"], g["games_played"]))
         num = den = 0.0
-        for i, yr in enumerate(recent_years):
+        for i in range(len(C.GP_RECENCY_WEIGHTS)):
+            yr = target - 1 - i
             if yr in gp:
                 num += C.GP_RECENCY_WEIGHTS[i] * gp[yr]; den += C.GP_RECENCY_WEIGHTS[i]
         proj_gp = float(np.clip(0.80 * (num / den) + 0.20 * 70.0, 1, C.MAX_GP)) if den else 60.0
@@ -104,6 +133,7 @@ def _score(pred: pd.DataFrame, col: str, actual_col: str) -> tuple[float, float]
 if __name__ == "__main__":
     df = _seasons_frame()
     curves = ac.build_skater_age_curves()
+    toi_curve = ac.build_toi_age_curve()
     test_seasons = [2022, 2023, 2024, 2025]
 
     print("Backtest: season-long POINTS (players with a real target-season sample)\n")
@@ -112,7 +142,7 @@ if __name__ == "__main__":
     agg = {"model": [], "naive1": [], "naive3": []}
     rate_agg = {"model": [], "last": []}
     for target in test_seasons:
-        pred = backtest_season(df, curves, target)
+        pred = backtest_season(df, curves, target, toi_curve)
         m_mae, m_rmse = _score(pred, "model_pts", "act_points")
         n1_mae, n1_rmse = _score(pred, "naive1", "act_points")
         n3_mae, n3_rmse = _score(pred, "naive3", "act_points")
