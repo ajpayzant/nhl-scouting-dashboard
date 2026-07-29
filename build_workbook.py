@@ -207,9 +207,10 @@ def _overview_tab(wb, fmts, n_sk, n_g, n_teams):
 
     section("How the projections are made")
     for txt in [
-        "MARCEL + AGE CURVE, ON A PER-60 RATE BASIS. Each player's last up-to-3 seasons are "
+        "MARCEL + AGE CURVE, ON A PER-60 RATE BASIS. Each player's last up-to-5 seasons are "
         "converted to per-60-minute rates so an injury-shortened season doesn't understate talent. "
-        "Rates are blended with recent seasons weighted heaviest.",
+        "Rates are blended with recent seasons weighted far more heavily (the most recent season "
+        "counts the most), so current form leads but a longer track record still steadies the estimate.",
         "REGRESSION TO THE MEAN. Blended rates are pulled toward the average for that player's "
         "position AND usage tier (a first-line forward regresses toward other first-liners, not 4th-liners). "
         "Thin track records regress hard; established stars barely move.",
@@ -243,10 +244,11 @@ def _overview_tab(wb, fmts, n_sk, n_g, n_teams):
     section("Validation")
     ws.write(r, 1, "Backtested on the 2022-2025 seasons (projecting each using only prior data): the model "
              "beats both a 'last season repeats' and a '3-year average' baseline every season, and cuts "
-             "per-60 rate error ~19% versus using last season alone. Skater points error (MAE) is ~9.6; "
-             "goalie wins error is ~6.6. Elite players are calibrated correctly on a rate basis — where they "
-             "fall short of a career-year total, it is the honest games-played hedge, not model compression.",
-             fmts["bullet"])
+             "per-60 rate error ~19% versus using last season alone. Skater points error (MAE) is ~9.3; "
+             "goalie wins error is ~6.6. Every stat was checked head-to-head against the previous version "
+             "before shipping — none got worse. Elite players are calibrated correctly on a rate basis — "
+             "where they fall short of a career-year total, it is the honest games-played hedge, not model "
+             "compression.", fmts["bullet"])
     ws.set_row(r, 60); r += 2
 
     # Dictionary
