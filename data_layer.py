@@ -60,9 +60,16 @@ def load_moneypuck_skaters(refresh: bool = False) -> pd.DataFrame:
     return out
 
 
-def load_moneypuck_skaters_pp(refresh: bool = False) -> pd.DataFrame:
-    """Power-play (5on4) skater rows, for PP-point context. One row per player-season."""
-    cache = C.DATA_RAW / "mp_skaters_pp.parquet"
+def load_moneypuck_situation(situation: str, refresh: bool = False) -> pd.DataFrame:
+    """Skater rows for one on-ice situation, every history season.
+
+    MoneyPuck splits each player-season into 'all', '5on5', '5on4' (power play),
+    '4on5' (short handed) and 'other'. The situation matters for a RATE: a player's
+    power-play points per 60 minutes of POWER PLAY is a real skill that survives a
+    change of team, whereas his PP points per 60 minutes of total ice time is mostly
+    a statement about how much power-play time his last coach gave him.
+    """
+    cache = C.DATA_RAW / f"mp_skaters_{situation}.parquet"
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
 
@@ -72,8 +79,70 @@ def load_moneypuck_skaters_pp(refresh: bool = False) -> pd.DataFrame:
             df = _moneypuck_csv(C.MONEYPUCK_SKATERS, yr)
         except requests.HTTPError:
             continue
-        df = df[df["situation"] == "5on4"].copy()
-        frames.append(df)
+        frames.append(df[df["situation"] == situation].copy())
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def load_moneypuck_skaters_pp(refresh: bool = False) -> pd.DataFrame:
+    """Power-play (5on4) skater rows, for PP-point context. One row per player-season."""
+    legacy = C.DATA_RAW / "mp_skaters_pp.parquet"
+    if legacy.exists() and not refresh and not (C.DATA_RAW / "mp_skaters_5on4.parquet").exists():
+        return pd.read_parquet(legacy)
+    return load_moneypuck_situation("5on4", refresh=refresh)
+
+
+def load_moneypuck_skaters_sh(refresh: bool = False) -> pd.DataFrame:
+    """Short-handed (4on5) skater rows, for short-handed points."""
+    return load_moneypuck_situation("4on5", refresh=refresh)
+
+
+SITUATIONS = ("all", "5on5", "5on4", "4on5")
+
+
+def refresh_skater_situations(situations=SITUATIONS) -> None:
+    """Download each season's skater file ONCE and split every situation out of it.
+
+    One MoneyPuck season file carries all five situations, so fetching it per situation
+    downloads the same bytes four times. This is the same work in a quarter of the
+    requests, which matters when it is 18 seasons.
+    """
+    frames = {s: [] for s in situations}
+    for yr in C.HISTORY_SEASONS:
+        try:
+            df = _moneypuck_csv(C.MONEYPUCK_SKATERS, yr)
+        except requests.HTTPError as e:
+            print(f"  [skip] skaters {yr}: {e}")
+            continue
+        for s in situations:
+            frames[s].append(df[df["situation"] == s].copy())
+        print(f"  skaters {yr}: {len(df)} rows -> "
+              + " ".join(f"{s}={len(frames[s][-1])}" for s in situations))
+    for s, parts in frames.items():
+        if not parts:
+            continue
+        out = pd.concat(parts, ignore_index=True)
+        name = "mp_skaters_all.parquet" if s == "all" else f"mp_skaters_{s}.parquet"
+        out.to_parquet(C.DATA_RAW / name, index=False)
+    # Keep the pre-split name working for anything that still asks for it by hand.
+    if "5on4" in frames and frames["5on4"]:
+        pd.concat(frames["5on4"], ignore_index=True).to_parquet(
+            C.DATA_RAW / "mp_skaters_pp.parquet", index=False)
+
+
+def load_moneypuck_teams_situation(situation: str, refresh: bool = False) -> pd.DataFrame:
+    """Team summaries for one on-ice situation (team-level power-play / short-handed)."""
+    cache = C.DATA_RAW / f"mp_teams_{situation}.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    frames = []
+    for yr in C.HISTORY_SEASONS:
+        try:
+            df = _moneypuck_csv(C.MONEYPUCK_TEAMS, yr)
+        except requests.HTTPError:
+            continue
+        frames.append(df[df["situation"] == situation].copy())
     out = pd.concat(frames, ignore_index=True)
     out.to_parquet(cache, index=False)
     return out
@@ -172,6 +241,44 @@ def load_nhl_goalie_summary(refresh: bool = False) -> pd.DataFrame:
     out = pd.concat(frames, ignore_index=True)
     out.to_parquet(cache, index=False)
     return out
+
+
+def load_nhl_goalie_bios(refresh: bool = False) -> pd.DataFrame:
+    """Goalie bios (birthDate, draft position) across history seasons.
+
+    The goalie model had no age term at all, so a 38-year-old was projected exactly
+    like a 28-year-old with the same recent numbers. This is the birthdate feed that
+    fixes it (age_curves.build_goalie_age_curves).
+    """
+    cache = C.DATA_RAW / "nhl_goalie_bios.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+
+    frames = []
+    for yr in C.HISTORY_SEASONS:
+        try:
+            rows = _nhl_paged(C.NHL_GOALIE_BIOS, yr)
+        except requests.HTTPError as e:
+            print(f"  [skip] goalie bios {yr}: {e}")
+            continue
+        df = pd.DataFrame(rows)
+        df["mp_season_year"] = yr
+        frames.append(df)
+        print(f"  goalie bios {yr}: {len(df)} goalies")
+        time.sleep(C.REQUEST_PAUSE)
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def goalie_birthdates(bios: pd.DataFrame) -> pd.DataFrame:
+    """Collapse goalie bios to one birthDate + draft position per playerId."""
+    b = bios.dropna(subset=["birthDate"]).sort_values("mp_season_year")
+    return b.groupby("playerId").agg(
+        birthDate=("birthDate", "last"),
+        fullName=("goalieFullName", "last"),
+        draftOverall=("draftOverall", "last"),
+    ).reset_index()
 
 
 # --------------------------------------------------------------------------- #

@@ -50,6 +50,9 @@ def _skater_history() -> pd.DataFrame:
 def _goalie_history() -> pd.DataFrame:
     h = pg._prep_goalie_seasons()
     h = h[h["mp_season_year"].isin(HIST_YEARS)].copy()
+    # The source file's own GAA column is not carried any more: `timeOnIce` is in SECONDS,
+    # so the honest GAA is computed from minutes rather than taken on trust.
+    h["goalsAgainstAverage"] = h["goalsAgainst"] * 60.0 / h["minutes"].replace(0, pd.NA)
     keep = ["playerId", "mp_season_year", "gamesPlayed", "wins", "savePct",
             "goalsAgainstAverage", "saves", "shutouts"]
     return h[keep]

@@ -1,5 +1,10 @@
-pandas>=2.0
-numpy>=1.24
-requests>=2.28
-pyarrow>=12.0
-scipy>=1.10   # optional: per-game prop probabilities in project_games.add_prop_probabilities
+# Upper bounds are deliberate. A shared deployment reinstalls these on every reboot, so
+# an unpinned major release (pandas 3, numpy 3) would break the app at a moment nobody
+# chose. Raise a ceiling on purpose, having run the app against it.
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+requests>=2.28,<3.0
+pyarrow>=12.0          # the parquet cache in data/raw
+streamlit>=1.50,<2.0   # the app: app/streamlit_app.py (run_app.bat launches it locally)
+xlsxwriter>=3.1,<4.0   # workbook export, both from the app and build_workbook.py
+scipy>=1.10,<2.0       # per-game prop probabilities in project_games.add_prop_probabilities

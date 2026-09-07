@@ -98,10 +98,15 @@ def schedule_context(season: int = C.TARGET_SEASON) -> pd.DataFrame:
     # Per-game raw weight = product of the three effects.
     sched["raw_weight"] = sched["opp_mult"] * sched["home_mult"] * sched["b2b_mult"]
 
-    # Season SOS factor: the mean opponent multiplier a team faces. For a balanced
-    # schedule this ~1.0; divisional weighting makes it deviate slightly => a real,
-    # small shift in the season total (this is the legitimate non-reshuffle part).
-    team_sos = sched.groupby("team")["opp_mult"].mean().rename("sos_factor")
+    # Season SOS factor: the mean opponent multiplier a team faces, RE-CENTRED so the
+    # league averages exactly 1.0. The centring is not cosmetic. opp_mult is built from
+    # 1/def_rating, and the mean of a reciprocal exceeds the reciprocal of the mean
+    # (Jensen), so the raw average came out above 1.0 for nearly every team -- strength
+    # of schedule was quietly handing the whole league a bonus of a few tenths of a
+    # percent instead of describing who has it easier than whom. Only the differences
+    # between teams are real; the level belongs to the league budget.
+    team_sos = sched.groupby("team")["opp_mult"].mean()
+    team_sos = (team_sos / team_sos.mean()).rename("sos_factor")
     sched = sched.merge(team_sos, on="team")
 
     # game_weight: normalize raw weights so each team's games average 1.0. This makes
