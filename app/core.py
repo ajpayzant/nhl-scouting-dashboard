@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 import config as C           # noqa: E402
 import data_layer as dl      # noqa: E402
+import live as lv            # noqa: E402
 import overrides as ov       # noqa: E402
 import project_goalies as pg  # noqa: E402
 import project_skaters as ps  # noqa: E402
@@ -90,6 +91,50 @@ def edit_team(team, **fields) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# the season in progress                                                      #
+# --------------------------------------------------------------------------- #
+# Once the season starts, a projection is only as current as the box scores behind it, so
+# the app pulls last night's numbers itself rather than waiting for the weekly data commit.
+# Hourly is the right cadence: it is three HTTP requests and about a second, and nothing in
+# a season-long projection moves faster than that. The schedule is deliberately NOT part of
+# it -- that is 32 requests and the only thing in it that changes is results, which the
+# stats file already carries.
+LIVE_TTL = 3600
+
+
+@st.cache_data(show_spinner="Checking the season so far ...", ttl=LIVE_TTL)
+def _live_pull() -> str:
+    """Refresh the live season at most once an hour; return a token for the cache keys.
+
+    The token is the point. Projections are cached on the CONTENT of the scenario, so
+    without something in the key that moves when the data moves, a container that has been
+    up since Tuesday would keep serving Tuesday's numbers forever.
+    """
+    try:
+        counts = dl.refresh_live(schedule=False)
+    except Exception:                                          # noqa: BLE001
+        counts = {}                    # a failed pull is not a broken app: use what we have
+    state = lv.season_state()
+    return (f"{state.as_of.date()}|{float(state.played.sum()):.0f}|"
+            f"{counts.get('skater_rows', 0)}")
+
+
+def live_token() -> str:
+    return _live_pull()
+
+
+@st.cache_data(show_spinner=False, ttl=LIVE_TTL)
+def season_state(token: str):
+    """Where the season stands, for any page that wants to say so. Cached on the token."""
+    return lv.season_state()
+
+
+def window_label() -> str:
+    """One line: what window the projections on screen actually cover."""
+    return season_state(live_token()).label()
+
+
+# --------------------------------------------------------------------------- #
 # projections                                                                 #
 # --------------------------------------------------------------------------- #
 # The cache key is the scenario itself, reduced to the parts that can change the
@@ -112,32 +157,33 @@ def _from_key(key: str) -> ov.Scenario:
                        league=d.get("league", {}))
 
 
+# `stamp` is never read: it is in the signature so that new box scores invalidate the cache.
 @st.cache_data(show_spinner="Projecting skaters ...", max_entries=6)
-def _skaters(key: str):
+def _skaters(key: str, stamp: str = ""):
     return ps.project_skaters(_from_key(key), with_budgets=True)
 
 
 @st.cache_data(show_spinner="Projecting goalies ...", max_entries=6)
-def _goalies(key: str):
+def _goalies(key: str, stamp: str = ""):
     return pg.project_goalies(_from_key(key), with_budgets=True)
 
 
 def skaters(sc: ov.Scenario | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(skaters, team budgets) for a scenario. Cached; safe to call from every view."""
-    return _skaters(_skater_key(sc or scenario()))
+    return _skaters(_skater_key(sc or scenario()), live_token())
 
 
 def goalies(sc: ov.Scenario | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return _goalies(_goalie_key(sc or scenario()))
+    return _goalies(_goalie_key(sc or scenario()), live_token())
 
 
 def baseline_skaters() -> tuple[pd.DataFrame, pd.DataFrame]:
     """The pure model, for showing what an edit changed."""
-    return _skaters(_skater_key(ov.Scenario()))
+    return _skaters(_skater_key(ov.Scenario()), live_token())
 
 
 def baseline_goalies() -> tuple[pd.DataFrame, pd.DataFrame]:
-    return _goalies(_goalie_key(ov.Scenario()))
+    return _goalies(_goalie_key(ov.Scenario()), live_token())
 
 
 # The counting stats a reader compares season to season, and the clock each one is
@@ -291,9 +337,9 @@ def team_ratings() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Projecting games ...", max_entries=3)
-def games(key: str) -> pd.DataFrame:
+def games(key: str, stamp: str = "") -> pd.DataFrame:
     import project_games as pgm
-    sk, _ = _skaters(key)
+    sk, _ = _skaters(key, stamp)
     return pgm.project_games(season_proj=sk)
 
 
@@ -353,6 +399,11 @@ def scenario_bar() -> None:
     n = sc.count()
     with st.sidebar:
         st.markdown(f"**{SEASON_LABEL} projections**")
+        # What window the numbers cover. Before opening night this says "preseason"; after
+        # it, it is the single most important thing on the screen -- a season total that
+        # already contains 24 games of hockey is a different claim from one that contains
+        # none, and a reader who does not know which he is looking at cannot use either.
+        st.caption(window_label())
         st.caption("Baseline model" if sc.is_baseline
                    else f"{edit_badge(n['edits'])} · "
                         f"{n['players']} skaters, {n['goalies']} goalies, {n['teams']} teams")

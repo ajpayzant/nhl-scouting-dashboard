@@ -45,6 +45,7 @@ import allocate as al
 import budgets as bg
 import config as C
 import data_layer as dl
+import live
 import overrides as ov
 
 FREE_AGENT = "FA"
@@ -69,15 +70,23 @@ LOCKABLE = ("starts", "gp", "minutes", "wins", "shutouts", "shots_against",
 # --------------------------------------------------------------------------- #
 # history                                                                     #
 # --------------------------------------------------------------------------- #
-def _prep_goalie_seasons() -> pd.DataFrame:
+def _prep_goalie_seasons(with_live: bool = False) -> pd.DataFrame:
     """One row per goalie-season, with every rate the projection needs.
 
     The sample gate is ICE TIME, not shots faced. The old `shotsAgainst >= 100` filter
     silently discarded a goalie's short seasons, which are exactly the seasons that tell
     you he is a third-stringer -- and since the workload claim is now only a statement
     about how a team's starts SPLIT, throwing them away biased that split.
+
+    `with_live` adds the season in progress, from the same feed. Off by default so nothing
+    that measures the model against history can see an unfinished season.
     """
     gs = dl.load_nhl_goalie_summary()
+    if with_live:
+        rows = dl.load_live_goalies()
+        if rows is not None and not rows.empty:
+            cols = [c for c in gs.columns if c in rows.columns]
+            gs = pd.concat([gs, rows[cols]], ignore_index=True)
     keep = ["playerId", "goalieFullName", "teamAbbrevs", "mp_season_year",
             "gamesPlayed", "gamesStarted", "wins", "losses", "otLosses",
             "savePct", "shutouts", "saves", "shotsAgainst", "goalsAgainst", "timeOnIce"]
@@ -122,12 +131,29 @@ def _age_mult(curves: dict, stat: str, from_age: float, to_age: float) -> float:
 # stage 1: claims                                                             #
 # --------------------------------------------------------------------------- #
 def _claim_rows(pool: pd.DataFrame, curves: dict, lvl: dict, regress_k: float,
-                target: int, max_gp: float) -> list[dict]:
-    """One unconstrained claim per goalie with a real NHL history."""
+                target: int, max_gp: float, live_frac: float = 0.0) -> list[dict]:
+    """One unconstrained claim per goalie with a real NHL history.
+
+    `live_frac` is how much of the season in progress has been played (0 preseason). It is
+    needed for exactly one thing and it matters: the workload claim is a COUNT of starts, so
+    a season 20 games old contributes 14 where a completed one contributes 57, and left
+    uncorrected that would rank a goalie who is starting every night below the partner he
+    replaced. The partial season's starts are therefore stated at full-season pace before
+    they are averaged. Every other quantity here is a rate and needs no such correction.
+    """
     years = sorted(pool["mp_season_year"].unique(), reverse=True)
     rate_w = dict(zip([target - 1, target - 2, target - 3], C.GOALIE_RECENCY_WEIGHTS))
+    if live_frac > 0:
+        # The season being played is the most recent season, so it carries the most recent
+        # weight -- and the shots-faced weighting inside the blend keeps a 400-shot sample
+        # from speaking as loudly as a 2000-shot one.
+        rate_w[target] = C.GOALIE_RECENCY_WEIGHTS[0]
     lg_ga_per_shot = 1.0 - lvl["sv_pct"]
+    # `max_gp` is the window being projected: 84 preseason, the games a team has LEFT once
+    # the season is running. A workload claim is a count, so it scales with the window, and
+    # nobody can start more games than remain.
     season_scale = max_gp / 82.0
+    start_cap = min(float(C.MAX_GOALIE_STARTS), max_gp)
     rows = []
 
     for pid, g in pool.groupby("playerId"):
@@ -162,11 +188,14 @@ def _claim_rows(pool: pd.DataFrame, curves: dict, lvl: dict, regress_k: float,
         num = den = 0.0
         for i, yr in enumerate([y for y in years if y in set(g["mp_season_year"])][:len(ww)]):
             w = ww[i]
-            num += w * float(g.loc[g["mp_season_year"] == yr, "gamesStarted"].iloc[0])
+            st = float(g.loc[g["mp_season_year"] == yr, "gamesStarted"].iloc[0])
+            if yr == target and live_frac > 0:
+                st /= live_frac          # a partial season, stated at full-season pace
+            num += w * st
             den += w
         claim_starts = (num / den) * season_scale if den > 0 else 1.0
         claim_starts *= _age_mult(curves, "workload", ref_age, target_age)
-        claim_starts = float(np.clip(claim_starts, 1.0, C.MAX_GOALIE_STARTS))
+        claim_starts = float(np.clip(claim_starts, min(1.0, max_gp), start_cap))
 
         gw = (g["rec_w"] * g["gamesPlayed"]).to_numpy(dtype=float)
         gw = gw if gw.sum() > 0 else np.ones(len(g))
@@ -195,7 +224,8 @@ def _claim_rows(pool: pd.DataFrame, curves: dict, lvl: dict, regress_k: float,
 
 
 def _rookie_rows(roster: pd.DataFrame, known: set[int], curves: dict,
-                 lvl: dict, target: int) -> list[dict]:
+                 lvl: dict, target: int, window: float = float(C.SEASON_GAMES)
+                 ) -> list[dict]:
     """Rostered goalies with no NHL history, projected from the league prior.
 
     Five of the 2026-27 rostered goalies had never played an NHL game and were dropped
@@ -227,7 +257,7 @@ def _rookie_rows(roster: pd.DataFrame, known: set[int], curves: dict,
             "rate_sa_per_60": lvl["sa_per_60"],
             "rate_relief_per_start": lvl["appearances_per_start"] - 1.0,
             "rate_so_per_start": lvl["shutouts_per_start"],
-            "claim_starts": C.SEASON_GAMES * C.ROOKIE_GOALIE_START_SHARE,
+            "claim_starts": window * C.ROOKIE_GOALIE_START_SHARE,
         })
     return rows
 
@@ -375,8 +405,14 @@ def _depth_chart(out: pd.DataFrame, gb: pd.DataFrame) -> pd.Series:
     return pd.Series(cov, dtype=float).reindex(gb.index).fillna(1.0)
 
 
-def _settle(out: pd.DataFrame, gb: pd.DataFrame, tilt: float, lvl: dict) -> None:
-    """Settle the chain, each link against the budget the link above it leaves."""
+def _settle(out: pd.DataFrame, gb: pd.DataFrame, tilt: float, lvl: dict,
+            start_cap: float | np.ndarray = float(C.MAX_GOALIE_STARTS)) -> None:
+    """Settle the chain, each link against the budget the link above it leaves.
+
+    `start_cap` may be one number or one per goalie: mid-season the ceiling is whatever is
+    left of both his season (MAX_GOALIE_STARTS minus what he has already started) and his
+    team's schedule.
+    """
     cov = _depth_chart(out, gb)
     gb["coverage"] = cov
 
@@ -391,7 +427,7 @@ def _settle(out: pd.DataFrame, gb: pd.DataFrame, tilt: float, lvl: dict) -> None
     #    into the claim, so this settlement only has to honour locks and the ceiling.
     out["proj_starts"] = al.settle_frame(
         out, "claim_starts", budget("starts"), tilt=tilt, lock_col="lock_starts",
-        cap=float(C.MAX_GOALIE_STARTS))
+        cap=start_cap)
 
     # 2. Relief appearances, settled separately from starts so that appearances can never
     #    come out below starts -- which is what a single appearances budget would allow.
@@ -506,7 +542,7 @@ PI_SVPCT_STD = 0.0151
 _PI_Z = 1.2816  # 80% central interval
 
 
-def _add_prediction_intervals(out: pd.DataFrame) -> None:
+def _add_prediction_intervals(out: pd.DataFrame, window: float | None = None) -> None:
     """p10/p90 bands. Volume bands are right-skewed; the rate band is symmetric.
 
     Save percentage is the one goalie number whose band should NOT be lognormal: it is a
@@ -534,7 +570,10 @@ def _add_prediction_intervals(out: pd.DataFrame) -> None:
     # Starts get the measured quantile table instead of a shape (C.GOALIE_START_BAND):
     # a backup's season is bimodal and no parametric band can be honest about it.
     tbl = C.GOALIE_START_BAND
-    scale = float(C.SEASON_GAMES) / float(tbl["measured_season"])
+    # The table is a full season's worth of starts, so it is stretched onto whatever window
+    # is being projected -- 84 games in September, the games left in February.
+    span = float(C.SEASON_GAMES) if window is None else float(window)
+    scale = span / float(tbl["measured_season"])
     st = out["proj_starts"].to_numpy(dtype=float)
     x = np.asarray(tbl["proj"], dtype=float) * scale
     p10 = np.interp(st, x, np.asarray(tbl["p10"], dtype=float) * scale)
@@ -560,15 +599,110 @@ def _add_prediction_intervals(out: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# the season in progress                                                      #
+# --------------------------------------------------------------------------- #
+# Two functions, and between them they are the whole of the difference between a preseason
+# goalie projection and a mid-season one. Everything above projects a WINDOW -- the games a
+# team has left -- and these turn a scenario's season totals into rest-of-season ones on the
+# way in, then add back what is already banked on the way out.
+def _locks_to_rest_of_season(out: pd.DataFrame, acts: pd.DataFrame) -> None:
+    """Turn every stated season total into what is left of it, in place.
+
+    A user who types "58 starts" means 58 for the season, not 58 more; if he has 14 already
+    the settlement below has to be told 44, or the edit silently becomes 72.
+    """
+    if acts is None or acts.empty:
+        return
+    by_id = acts.set_index("playerId")
+    for stat in LOCKABLE:
+        col = f"act_{stat}"
+        if col not in by_id:
+            continue
+        banked = out["playerId"].map(by_id[col]).fillna(0.0).to_numpy(dtype=float)
+        fixed = out[f"fixed_{stat}"].to_numpy(dtype=float)
+        left = np.maximum(fixed - banked, 0.0)
+        out[f"fixed_{stat}"] = np.where(np.isfinite(fixed), left, fixed)
+    # `starts` is the one lock that is also a claim: it ranks the depth chart.
+    fixed_st = out["fixed_starts"].to_numpy(dtype=float)
+    out["claim_starts"] = np.where(np.isfinite(fixed_st), fixed_st,
+                                   out["claim_starts"].to_numpy(dtype=float))
+
+
+FOLDABLE = ("starts", "relief", "gp", "minutes", "wins", "losses", "otl", "shutouts",
+            "saves", "shots_against", "goals_against")
+
+
+def _fold_in_actuals(out: pd.DataFrame, acts: pd.DataFrame, state) -> None:
+    """`proj_* = act_* + ros_*`, in place, so every column keeps meaning a season total.
+
+    The rates are recomputed from the folded counts rather than blended, which is the only
+    way a reader gets a save percentage that is actually his season's save percentage: a
+    goalie at .935 through 12 starts with a .905 projection for the rest of the year is not
+    a .920 goalie, he is whatever the combined shots say he is.
+    """
+    by_id = acts.set_index("playerId") if acts is not None and not acts.empty else None
+
+    def banked(name: str) -> pd.Series:
+        col = f"act_{name}"
+        if by_id is None or col not in by_id:
+            return pd.Series(0.0, index=out.index)
+        return out["playerId"].map(by_id[col]).fillna(0.0).astype(float)
+
+    for name in FOLDABLE:
+        act = banked(name)
+        out[f"act_{name}"] = act.round(1)
+        for prefix in ("proj_", "unc_"):
+            col = f"{prefix}{name}"
+            if col not in out:
+                continue
+            if prefix == "proj_":
+                out[f"ros_{name}"] = out[col].round(1)
+            out[col] = (out[col] + act).round(1)
+        for tail in ("p10", "p90"):
+            b = f"{name}_{tail}"
+            if b in out:
+                out[f"ros_{b}"] = out[b].round(1)
+                out[b] = (out[b] + act).round(1)
+
+    sa = out["proj_shots_against"].to_numpy(dtype=float)
+    ga = out["proj_goals_against"].to_numpy(dtype=float)
+    mins = out["proj_minutes"].to_numpy(dtype=float)
+    gp = out["proj_gp"].to_numpy(dtype=float)
+    out["proj_saves"] = np.round(sa - ga, 1)
+    out["proj_save_pct"] = np.where(sa > 0, 1.0 - ga / np.maximum(sa, 1e-9),
+                                    out["proj_save_pct"])
+    out["proj_gaa"] = np.where(mins > 0, ga * 60.0 / np.maximum(mins, 1e-9), np.nan)
+    out["min_per_gp"] = np.where(gp > 0, mins / np.maximum(gp, 1e-9), 0.0)
+
+    # The save-percentage band tightens in proportion to how much of the season's shots are
+    # still to be faced: the shots he has already stopped carry no uncertainty at all.
+    ros_sa = out["ros_shots_against"].to_numpy(dtype=float)
+    frac = np.where(sa > 0, np.clip(ros_sa / np.maximum(sa, 1e-9), 0.0, 1.0), 1.0)
+    locked_sv = out["lock_sv"].to_numpy(dtype=bool) if "lock_sv" in out else np.zeros(len(out), bool)
+    half = np.where(locked_sv, 0.0, _PI_Z * PI_SVPCT_STD * frac)
+    out["save_pct_p10"] = np.round(np.clip(out["proj_save_pct"] - half, 0, 1), 4)
+    out["save_pct_p90"] = np.round(np.clip(out["proj_save_pct"] + half, 0, 1), 4)
+    sa_per_60 = np.where(mins > 0, sa * 60.0 / np.maximum(mins, 1e-9), np.nan)
+    out["gaa_p10"] = np.round(sa_per_60 * (1.0 - out["save_pct_p90"]), 2)
+    out["gaa_p90"] = np.round(sa_per_60 * (1.0 - out["save_pct_p10"]), 2)
+
+    out["season_frac_played"] = round(float(state.frac_played), 3)
+
+
+# --------------------------------------------------------------------------- #
 # entry point                                                                 #
 # --------------------------------------------------------------------------- #
 def project_goalies(scenario: ov.Scenario | None = None, verbose: bool = False,
-                    with_budgets: bool = False):
+                    with_budgets: bool = False, in_season: bool | None = None):
     """Season-long goalie projections, settled against team budgets.
 
     With `with_budgets`, returns (goalies, goalie_budgets); the budget frame carries each
     team's 84 starts, what its listed goalies covered and what is left for the goalies
     nobody has named yet, which is what the app shows to explain a number.
+
+    Once the season is running the same machinery projects the games each team has LEFT and
+    adds what is already banked back on at the end, so every column still means a season
+    total. `in_season=False` forces the preseason view; the default follows the calendar.
     """
     sc = scenario
     cfg = sc.settings() if sc is not None else C.league_defaults()
@@ -578,18 +712,27 @@ def project_goalies(scenario: ov.Scenario | None = None, verbose: bool = False,
     regress_k = float(cfg["goalie_regress_shots"])
 
     target = C.TARGET_SEASON
-    hist = _prep_goalie_seasons()
+    state = live.season_state()
+    use_live = state.live if in_season is None else bool(in_season and state.live)
+    hist = _prep_goalie_seasons(with_live=use_live)
     curves = ac.build_goalie_age_curves()
     lvl = bg.goalie_league_level()
     lvl.setdefault("otl_per_start", _otl_per_start(hist))
 
     recent = [target - 1, target - 2, target - 3]
+    if use_live:
+        recent.append(target)
     pool = hist[hist["mp_season_year"].isin(recent)].copy()
     roster = dl.load_rosters(target)
 
-    rows = _claim_rows(pool, curves, lvl, regress_k, target, max_gp)
+    # The window: a whole season, or what is left of this one.
+    acts = live.goalie_actuals() if use_live else pd.DataFrame()
+    live_frac = float(state.frac_played) if use_live else 0.0
+    window = float(state.remaining.mean()) if use_live else max_gp
+
+    rows = _claim_rows(pool, curves, lvl, regress_k, target, window, live_frac)
     known = {r["playerId"] for r in rows}
-    rows += _rookie_rows(roster, known, curves, lvl, target)
+    rows += _rookie_rows(roster, known, curves, lvl, target, window)
     out = pd.DataFrame(rows).reset_index(drop=True)
 
     # Team for the season being projected comes from the published roster; a goalie on no
@@ -620,6 +763,8 @@ def project_goalies(scenario: ov.Scenario | None = None, verbose: bool = False,
         out.loc[cut, "team"] = FREE_AGENT
 
     _apply_edits(out, sc)
+    if use_live:
+        _locks_to_rest_of_season(out, acts)
     out["status"] = np.where(out["on_roster"], "roster",
                              np.where(out["camp"], "camp", "unsigned"))
 
@@ -631,24 +776,39 @@ def project_goalies(scenario: ov.Scenario | None = None, verbose: bool = False,
     out["unc_goals_against"] = out["unc_shots_against"] * out["rate_ga_per_shot"]
     out["unc_save_pct"] = (1.0 - out["rate_ga_per_shot"]).round(4)
 
+    # A goalie's remaining ceiling is whatever is left of both his season and his team's
+    # schedule: nobody starts 68 more games in February, and nobody starts 30 of the 22 his
+    # team has left.
+    if use_live:
+        banked_st = (out["playerId"].map(acts.set_index("playerId")["act_starts"])
+                     .fillna(0.0).to_numpy(dtype=float)) if not acts.empty else 0.0
+        team_left = out["team"].map(state.remaining).fillna(window).to_numpy(dtype=float)
+        start_cap = np.maximum(np.minimum(C.MAX_GOALIE_STARTS - banked_st, team_left), 0.0)
+    else:
+        start_cap = float(C.MAX_GOALIE_STARTS)
+
     gb = None
     if not enforce:
-        _no_budget_projection(out, lvl, max_gp)
+        _no_budget_projection(out, lvl, window)
     else:
         teams = sorted(t for t in out.loc[out["on_roster"], "team"].unique()
                        if t != FREE_AGENT)
         claims = out[out["on_roster"]].groupby("team")[
             ["unc_goals_against", "unc_shots_against"]].sum()
         claims.columns = ["goals_against", "shots_against"]
-        gb = bg.goalie_budgets(target, teams=teams, games=int(max_gp), claims=claims,
-                               shrink=float(cfg["team_rating_shrink"]))
+        gb = bg.goalie_budgets(target, teams=teams,
+                               games=(state.remaining if use_live else int(max_gp)),
+                               claims=claims, shrink=float(cfg["team_rating_shrink"]))
         gb = _apply_team_edits(gb, sc)
-        _settle(out, gb, tilt, lvl)
+        _settle(out, gb, tilt, lvl, start_cap=start_cap)
         if verbose:
             print(al.budget_report(out[out["on_roster"]], "claim_starts", "proj_starts",
                                    gb["starts"].to_dict()).round(2).to_string())
 
-    _add_prediction_intervals(out)
+    _add_prediction_intervals(out, window=window)
+    if use_live:
+        _fold_in_actuals(out, acts, state)
+        out = out.copy()          # the fold fragments the frame; consolidate once
 
     for col in out.columns:
         if col.startswith(("proj_", "claim_", "unc_")) and \
@@ -657,9 +817,15 @@ def project_goalies(scenario: ov.Scenario | None = None, verbose: bool = False,
             out[col] = out[col].round(1)
     out["proj_save_pct"] = out["proj_save_pct"].round(4)
     out["proj_gaa"] = out["proj_gaa"].round(2)
+    out["min_per_gp"] = pd.Series(out["min_per_gp"], index=out.index).round(1)
     out = out.sort_values("proj_wins", ascending=False).reset_index(drop=True)
     out.attrs["scenario"] = "baseline" if sc is None else sc.name
     out.attrs["league_sv_pct"] = lvl["sv_pct"]
+    out.attrs["in_season"] = bool(use_live)
+    out.attrs["team_games_played"] = float(state.team_games_played) if use_live else 0.0
+    out.attrs["frac_played"] = float(state.frac_played) if use_live else 0.0
+    out.attrs["as_of"] = str(state.as_of.date())
+    out.attrs["window"] = state.label()
     return (out, gb) if with_budgets else out
 
 
@@ -723,15 +889,20 @@ if __name__ == "__main__":
     print(on[cols].head(20).to_string(index=False))
 
     teams = len(gb)
-    print("\nAccounting identities (allocated | budget | budget x coverage):")
-    checks = [("starts", 84.0 * teams), ("wins", 42.0 * teams),
+    print(f"\nWindow: {out.attrs['window']}")
+    print("Accounting identities (allocated | budget | budget x coverage):")
+    # The identities are one start per team-game and half the games won, whatever the window.
+    team_games = float(gb["games"].sum()) if "games" in gb else 84.0 * teams
+    checks = [("starts", team_games), ("wins", team_games / 2.0),
               ("appearances", None), ("minutes", None),
               ("shots_against", None), ("goals_against", None), ("shutouts", None)]
-    alloc = {"starts": "proj_starts", "wins": "proj_wins", "appearances": "proj_gp",
-             "minutes": "proj_minutes", "shots_against": "proj_shots_against",
-             "goals_against": "proj_goals_against", "shutouts": "proj_shutouts"}
+    alloc = {"starts": "starts", "wins": "wins", "appearances": "gp",
+             "minutes": "minutes", "shots_against": "shots_against",
+             "goals_against": "goals_against", "shutouts": "shutouts"}
+    # Mid-season the budget covers the games LEFT, so the identity is about the ros_ half.
+    stem = "ros_" if out.attrs.get("in_season") else "proj_"
     for key, hard in checks:
-        got = on[alloc[key]].sum()
+        got = on[stem + alloc[key]].sum()
         full = gb[key].sum()
         eff = (gb[key] * gb["coverage"]).sum()
         flag = "" if abs(got - eff) < max(0.01 * eff, 0.05) else "  <-- MISS"

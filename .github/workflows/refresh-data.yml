@@ -1,4 +1,4 @@
-# Re-download the source data, re-run the projections, and commit the diff.
+# Re-download the source data, re-run the projections, file a snapshot, commit the diff.
 #
 # The deployed app reads the parquet cache that lives in this repo, so a commit here is
 # how the shared app learns about a trade, a signing or last night's games: Streamlit
@@ -7,12 +7,25 @@
 # Deliberately scheduled rather than done on request. A projection people are reading
 # should change at a moment somebody can point at, and the diff on data/ and output/ is
 # the record of what changed.
+#
+# TWO CADENCES, ONE FILE. Once the season starts the projection is banked totals plus the
+# games that are left, so it has to move every morning -- last night's games are already
+# history and a tool still serving Tuesday's numbers on Friday is wrong in a way that gets
+# worse each night. That daily run is cheap: three MoneyPuck requests and the 32 rosters.
+# The full re-download (five seasons of history, every bio file) is worth doing weekly and
+# no more, because completed seasons do not change. They live in one workflow rather than
+# two so they share a concurrency group and can never fight over the same commit.
 name: Refresh data and projections
 
 on:
   schedule:
-    - cron: "20 11 * * 2"      # Tuesdays, 11:20 UTC (early morning North America)
+    - cron: "20 11 * * *"       # every morning, 11:20 UTC (early morning North America)
   workflow_dispatch:            # and whenever you ask for it from the Actions tab
+    inputs:
+      full:
+        description: "Re-download all history, not just the season in progress"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,14 +48,40 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # --refresh re-downloads MoneyPuck and the NHL API and rewrites data/raw, then
-      # writes the projection CSVs. PYTHONUTF8 because accented names are not optional.
-      - name: Refresh
+      # Tuesday is the full re-download; every other morning is the season in progress.
+      # `workflow_dispatch` can force a full run from the Actions tab.
+      - name: Decide how much to refresh
+        id: mode
+        run: |
+          if [ "${{ inputs.full }}" = "true" ] || [ "$(date -u +%u)" = "2" ]; then
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "full=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --refresh re-downloads MoneyPuck and the NHL API and rewrites data/raw; --snapshot
+      # files the dated copy the Model performance page scores against. PYTHONUTF8 because
+      # accented names are not optional.
+      - name: Refresh everything (weekly)
+        if: steps.mode.outputs.full == 'true'
         env:
           PYTHONUTF8: "1"
-        run: python run.py --refresh
+        run: python run.py --refresh --snapshot
+
+      # --refresh-live is three requests: skaters, goalies, teams. Rosters come too, since
+      # a callup or a trade is exactly what a reader notices first. The schedule is left
+      # alone -- games PLAYED is read off the stats file, and the only thing the schedule
+      # supplies is how many games a team has in total, which the weekly run keeps current.
+      - name: Refresh the season in progress (daily)
+        if: steps.mode.outputs.full != 'true'
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python -c "import data_layer as dl; dl.load_rosters(refresh=True)"
+          python run.py --refresh-live --snapshot
 
       - name: Rebuild the workbook export
+        if: steps.mode.outputs.full == 'true'
         env:
           PYTHONUTF8: "1"
         run: python build_workbook.py
@@ -51,10 +90,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/raw output
+          git add data/raw data/snapshots output
           if git diff --cached --quiet; then
             echo "No change in the source data."
           else
-            git commit -m "Refresh source data and projections ($(date -u +%Y-%m-%d))"
+            git commit -m "Refresh data and projections ($(date -u +%Y-%m-%d))"
             git push
           fi

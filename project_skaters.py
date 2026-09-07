@@ -49,6 +49,7 @@ import data_layer as dl
 import age_curves as ac
 import allocate as al
 import budgets as bg
+import live
 import overrides as ov
 
 # Rates measured against ALL of a player's ice time.
@@ -83,9 +84,11 @@ SIT_PREFIXES = tuple(p for p, _ in SIT_SOURCES)
 # --------------------------------------------------------------------------- #
 # history                                                                     #
 # --------------------------------------------------------------------------- #
-def _situation_table(situation: str, prefix: str) -> pd.DataFrame:
+def _situation_table(situation: str, prefix: str, with_live: bool = False) -> pd.DataFrame:
     """Per player-season points and ice time in one on-ice situation."""
     sit = dl.load_moneypuck_situation(situation)
+    if with_live:
+        sit = _append_live(sit, dl.load_live_skaters(situation=situation))
     pts = (sit["I_F_goals"] + sit["I_F_primaryAssists"] + sit["I_F_secondaryAssists"])
     return pd.DataFrame({
         "playerId": sit["playerId"].to_numpy(),
@@ -95,16 +98,38 @@ def _situation_table(situation: str, prefix: str) -> pd.DataFrame:
     })
 
 
-def _prep_skater_seasons() -> pd.DataFrame:
-    """One row per player-season: per-60 rates on the right clock, ice time, age, position."""
+def _append_live(hist: pd.DataFrame, live_rows: pd.DataFrame) -> pd.DataFrame:
+    """Stack the season in progress onto the completed seasons.
+
+    The live file is the same file, for a season that is not over. So it needs no special
+    handling anywhere downstream: it is one more player-season, weighted by the ice time it
+    contains, which after five games is about 5% of a full season and by March is all of it.
+    Only the columns the history already has are carried over, so a new column appearing in
+    the source cannot quietly change the shape of the frame the model is built on.
+    """
+    if live_rows is None or live_rows.empty:
+        return hist
+    cols = [c for c in hist.columns if c in live_rows.columns]
+    return pd.concat([hist, live_rows[cols]], ignore_index=True)
+
+
+def _prep_skater_seasons(with_live: bool = False) -> pd.DataFrame:
+    """One row per player-season: per-60 rates on the right clock, ice time, age, position.
+
+    `with_live` adds the season in progress. Off by default so that anything measuring the
+    model against history -- the backtest above all -- cannot accidentally see a season that
+    is not finished.
+    """
     df = dl.load_moneypuck_skaters()
+    if with_live:
+        df = _append_live(df, dl.load_live_skaters(situation="all"))
     births = dl.player_birthdates(dl.load_nhl_skater_bios())
     df = df.merge(births[["playerId", "birthDate", "positionCode", "fullName"]],
                   on="playerId", how="left")
     # Prefer the NHL API's accented name over MoneyPuck's ASCII-stripped one.
     df["name"] = df["fullName"].fillna(df["name"])
     for prefix, situation in SIT_SOURCES:
-        df = df.merge(_situation_table(situation, prefix),
+        df = df.merge(_situation_table(situation, prefix, with_live=with_live),
                       on=["playerId", "mp_season_year"], how="left")
         df[f"{prefix}_points_raw"] = df[f"{prefix}_points_raw"].fillna(0.0)
         df[f"{prefix}_toi_min"] = df[f"{prefix}_toi_min"].fillna(0.0)
@@ -237,12 +262,44 @@ def _project_gp(g: pd.DataFrame) -> tuple[float, float]:
     return float(np.clip(proj, 1, C.MAX_GP)), float(rel)
 
 
+def _live_availability(hist_share: float, act_gp: float, team_played: float) -> float:
+    """A player's share of the games AHEAD of him, given how many he has already missed.
+
+    `hist_share` is what his history says (his projected full season over 84). The season in
+    progress is evidence about the same quantity and is blended in at
+    `n / (n + C.IN_SEASON_GP_K)` with K = 20 team-games: a player who has played 8 of his
+    team's 20 is moved halfway toward being that player, not all the way. Injuries arrive in
+    blocks of twenty games rather than as independent draws, so the naive per-game Bernoulli
+    weight (K around 6) would read one six-week absence as a permanent condition; there is no
+    injury feed here, so this is a prior and the honest thing to do with it is to move slowly
+    and let a reader state the games on the player's page when he knows more than the model.
+    """
+    if team_played <= 0:
+        return hist_share
+    w = float(team_played / (team_played + C.IN_SEASON_GP_K))
+    live_share = float(np.clip(act_gp / team_played, 0.0, 1.0))
+    return float(np.clip((1.0 - w) * hist_share + w * live_share, 0.0, 1.0))
+
+
 def _claim_rows(pool: pd.DataFrame, pos_means: dict, curves: dict,
-                toi_curve: dict, regress_k: float) -> list[dict]:
-    """One unconstrained claim per player with NHL history."""
+                toi_curve: dict, regress_k: float,
+                acts: dict | None = None, team_played: float = 0.0) -> list[dict]:
+    """One unconstrained claim per player with NHL history.
+
+    `acts` maps playerId -> (games, ice time) already played this season, and `team_played`
+    is the league mean team-games so far. Given those, two quantities stop coming from
+    history alone: ice time per game, which moves fast, and availability, which is returned
+    as a SHARE of the games ahead rather than a count -- how many games are ahead depends on
+    the player's team, which is not known until the roster is joined on.
+    """
     target = C.TARGET_SEASON
     wmap = dict(zip([target - i for i in range(1, C.SKATER_HISTORY_SEASONS + 1)],
                     C.RECENCY_WEIGHTS))
+    # The season in progress is the most recent season, so it earns the most recent season's
+    # weight; the ice-time weighting inside the blend is what keeps a five-game sample from
+    # behaving as though it were a five-hundred-minute one.
+    wmap[target] = C.RECENCY_WEIGHTS[C.LIVE_RECENCY_WEIGHT_INDEX]
+    acts = acts or {}
     rows = []
     for pid, g in pool.groupby("playerId"):
         g = g.sort_values("mp_season_year")
@@ -262,9 +319,27 @@ def _claim_rows(pool: pd.DataFrame, pos_means: dict, curves: dict,
         # Ice time per game from the player's own history, then age-trended: young
         # players earn bigger roles and veterans lose them, and projecting from history
         # alone under-projects risers (~-34% at 18-21) and over-projects fading vets.
-        sample_toipg = float(np.average(g["toi_per_gp"], weights=blend_w))
+        #
+        # Measured on COMPLETED seasons only, deliberately. Ice time is the fastest-moving
+        # thing in a season -- a promotion to the first line is visible in three games -- and
+        # the ice-time weighting that is right for a per-60 rate is far too slow for the
+        # minutes themselves: after eight games a 20-minute player has ~8% of the blend's
+        # weight, where the measured answer (C.IN_SEASON_TOI_K = 8 player-games) is nearer
+        # half. So the live season is left out here and blended in explicitly below.
+        done = g[g["mp_season_year"] < target]
+        if len(done):
+            dw = blend_w[(g["mp_season_year"] < target).to_numpy()]
+            sample_toipg = float(np.average(done["toi_per_gp"], weights=dw)) \
+                if dw.sum() > 0 else float(done["toi_per_gp"].mean())
+        else:
+            sample_toipg = float(np.average(g["toi_per_gp"], weights=blend_w))
         toipg = sample_toipg * ac.age_multiplier({"toi": toi_curve}, "toi",
                                                  mean_age, target_age)
+        act = acts.get(int(pid))
+        live_gp = float(act["gp"]) if act else 0.0
+        toi_w = live_gp / (live_gp + C.IN_SEASON_TOI_K) if live_gp > 0 else 0.0
+        if toi_w > 0:
+            toipg = (1.0 - toi_w) * toipg + toi_w * (act["toi"] / live_gp)
 
         row = {
             "playerId": int(pid), "name": latest["name"],
@@ -296,12 +371,21 @@ def _claim_rows(pool: pd.DataFrame, pos_means: dict, curves: dict,
             mult = ac.age_multiplier(curves, AGE_CURVE_FOR.get(stat, stat),
                                      mean_age, target_age)
             row[f"rate_{stat}"] = reg * mult
+            # Power-play ice time moves for the same reason total ice time does, and faster:
+            # a promotion to the first unit is a decision, not a trend. Same explicit blend.
             sit_toipg = float(np.average(g[f"{prefix}_toi_per_gp"], weights=blend_w))
+            if toi_w > 0:
+                sit_toipg = (1.0 - toi_w) * sit_toipg + toi_w * (act[f"{prefix}_toi"] / live_gp)
             row[f"claim_{prefix}_toi_per_gp"] = sit_toipg
 
         proj_gp, gp_rel = _project_gp(g)
         row["claim_gp"] = proj_gp
         row["gp_reliability"] = gp_rel
+        # Availability as a SHARE of whatever games are ahead. In a full-season run this is
+        # just proj_gp/84 and multiplying it back out changes nothing; in season it is the
+        # number that has to be used, because 84 games are not ahead of anybody.
+        row["avail_share"] = _live_availability(proj_gp / float(C.SEASON_GAMES),
+                                                live_gp, team_played)
         row["claim_toi_per_gp"] = toipg
         rows.append(row)
     return rows
@@ -344,6 +428,7 @@ def _rookie_rows(roster: pd.DataFrame, known: set, pos_means: dict,
             row[f"claim_{prefix}_toi_per_gp"] = tier.get(f"{prefix}_toi_per_gp", 0.0)
         row["claim_gp"] = C.ROOKIE_GP
         row["gp_reliability"] = C.ROOKIE_GP_RELIABILITY
+        row["avail_share"] = C.ROOKIE_GP / float(C.SEASON_GAMES)
         rows.append(row)
     return rows
 
@@ -525,6 +610,104 @@ def _cut_camp_bodies(out: pd.DataFrame) -> None:
     out.loc[cut, "team"] = FREE_AGENT
 
 
+# --------------------------------------------------------------------------- #
+# the season in progress                                                      #
+# --------------------------------------------------------------------------- #
+# Everything the model settles -- ice time, games, goals -- is settled over a WINDOW. The
+# window used to be the season, because the season had not started. These three functions
+# are the whole of the difference: they narrow the window to the games that are left, keep a
+# stated season total meaning a season total, and then add back what is already banked so
+# every other column in the frame carries on meaning what it always meant.
+def _to_rest_of_season_gp(out: pd.DataFrame, window: np.ndarray, acts: dict) -> None:
+    """Rewrite the games-played claim as games REMAINING, in place.
+
+    Preseason `claim_gp` is a count out of 84. In season the count that matters is out of
+    what is left, and the durable part of the claim is the SHARE (`avail_share`, which the
+    claim step already blended with how many games he has actually played). A locked games
+    total is a statement about the season, so what it asks of the remaining games is the
+    stated number minus the games he has played -- and if he has already passed it, zero.
+    """
+    banked = out["playerId"].map(lambda p: acts.get(int(p), {}).get("gp", 0.0)) \
+        .astype(float).to_numpy()
+    share = out["avail_share"].fillna(0.0).to_numpy(dtype=float) \
+        if "avail_share" in out else np.zeros(len(out))
+    ros = share * window
+    locked = out["lock_gp"].to_numpy(dtype=bool) if "lock_gp" in out else np.zeros(len(out), bool)
+    stated = out["claim_gp"].to_numpy(dtype=float)
+    out["claim_gp"] = np.clip(np.where(locked, stated - banked, ros), 0.0, window)
+    out["team_games_left"] = np.round(window, 1)
+
+
+def _locks_to_rest_of_season(out: pd.DataFrame, acts: pd.DataFrame) -> None:
+    """Turn every stated season total into what is left of it, in place."""
+    if acts is None or acts.empty:
+        return
+    by_id = acts.set_index("playerId")
+    for stat in COUNT_STATS:
+        col = f"act_{stat}"
+        if col not in by_id:
+            continue
+        banked = out["playerId"].map(by_id[col]).fillna(0.0).to_numpy(dtype=float)
+        fixed = out[f"fixed_{stat}"].to_numpy(dtype=float)
+        left = np.maximum(fixed - banked, 0.0)
+        out[f"fixed_{stat}"] = np.where(np.isfinite(fixed), left, fixed)
+        out[f"claim_{stat}"] = np.where(np.isfinite(fixed), left,
+                                        out[f"claim_{stat}"].to_numpy(dtype=float))
+
+
+# Every quantity that is a SUM over games, and so can be banked and added to. Rates
+# (per-60s, per-game ice time) are not here on purpose: they are recomputed from the totals
+# below, because a season-to-date average is the ratio of the two halves and not their sum.
+FOLDABLE = COUNT_STATS + ["assists", "points", "gp", "toi", "pp_toi", "sh_toi"]
+
+
+def _fold_in_actuals(out: pd.DataFrame, acts: pd.DataFrame, state) -> None:
+    """`proj_* = act_* + ros_*`, in place, with the bands carried up with the mean.
+
+    The bands are the reason this order matters. They were drawn on the rest of the season,
+    where the uncertainty actually lives, so shifting them up by a banked total narrows them
+    exactly as much as the season has narrowed them: a player 60 games into a season has 24
+    games of spread left around a number that is mostly already decided. Drawing them on the
+    full-season total instead would keep publishing a September-width band in March.
+    """
+    empty = pd.Series(0.0, index=out.index)
+    by_id = acts.set_index("playerId") if acts is not None and not acts.empty else None
+
+    def banked(name: str) -> pd.Series:
+        if by_id is None or f"act_{name}" not in by_id:
+            return empty
+        return out["playerId"].map(by_id[f"act_{name}"]).fillna(0.0).astype(float)
+
+    for name in FOLDABLE:
+        proj, unc = f"proj_{name}", f"unc_{name}"
+        if proj not in out:
+            continue
+        act = banked(name)
+        out[f"act_{name}"] = act.round(1)
+        out[f"ros_{name}"] = out[proj].round(1)
+        out[proj] = (out[proj] + act).round(1)
+        if unc in out:
+            out[unc] = (out[unc] + act).round(1)
+        for tail in ("p10", "p90"):
+            b = f"{name}_{tail}"
+            if b in out:
+                out[f"ros_{b}"] = out[b].round(1)
+                out[b] = (out[b] + act).round(1)
+
+    # Per-game numbers are ratios of the two halves, so they are recomputed rather than
+    # added: what a reader wants next to a season total is the season's average ice time.
+    gp = out["proj_gp"].to_numpy(dtype=float)
+    safe = np.where(gp > 0, gp, 1.0)
+    for stem in ("toi", "pp_toi", "sh_toi"):
+        col = f"proj_{stem}_per_gp"
+        if col in out and f"proj_{stem}" in out:
+            out[col] = np.where(gp > 0, out[f"proj_{stem}"].to_numpy(dtype=float) / safe, 0.0)
+    if "points_rate_check" in out:
+        out["points_rate_check"] = (out.get("act_points", empty)
+                                    + out["rate_points"] * out["ros_toi"] / 60.0).round(1)
+    out["season_frac_played"] = round(float(state.frac_played), 3)
+
+
 COVERAGE_SCALED = ["goals", "ixg", "shots", "blocks", "hits", "pim", "faceoffs_won",
                    "primaryAssists", "secondaryAssists", "assists", "points"]
 
@@ -550,8 +733,7 @@ def _record_coverage(out: pd.DataFrame, tb: pd.DataFrame) -> None:
         tb[f"depth_{name}"] = (tb[bcol] - got).clip(lower=0.0)
 
 
-def _settle(out: pd.DataFrame, tb: pd.DataFrame, tilt: float, lvl: dict,
-            max_gp: float) -> None:
+def _settle(out: pd.DataFrame, tb: pd.DataFrame, tilt: float, lvl: dict, max_gp) -> None:
     """Settle every claim against its team budget, in the order the constraints bind.
 
     Volume settles DOWNWARD ONLY. A team's ice time is played by ~28 skaters over a
@@ -574,9 +756,12 @@ def _settle(out: pd.DataFrame, tb: pd.DataFrame, tilt: float, lvl: dict,
 
     # 1. Games played. 18 skaters dress every night, so a team has exactly 18 x 84
     #    skater-games to hand out however deep or thin its roster is.
+    # `max_gp` is the WINDOW: 84 preseason, and each player's team's remaining games once
+    # the season is under way, which is why it is allowed to be per player rather than one
+    # number for the league.
     out["proj_gp"] = al.settle_frame(out, "claim_gp", budget("skater_games"), tilt=tilt,
                                     lock_col="lock_gp", cap=max_gp, only_reduce=True)
-    out["proj_gp"] = out["proj_gp"].clip(lower=0.0, upper=max_gp)
+    out["proj_gp"] = np.clip(out["proj_gp"].to_numpy(dtype=float), 0.0, max_gp)
 
     # 2. Ice time, given the games. The hardest constraint in the sport: 297.4
     #    skater-minutes per team-game, measured to within two tenths of a percent every
@@ -665,7 +850,7 @@ PI_FLOOR = {"points": 4.0, "goals": 2.0, "assists": 3.0, "shots": 15.0,
 _PI_Z = 1.2816     # 80% central interval
 
 
-def _add_prediction_intervals(out: pd.DataFrame) -> None:
+def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> None:
     """p10/p90 for every stat, plus games played, right-skewed and non-negative.
 
     Two changes from the symmetric normal band this used to draw. First, season counting
@@ -695,13 +880,19 @@ def _add_prediction_intervals(out: pd.DataFrame) -> None:
         out[f"{stat}_p90"] = np.round(hi, 1)
 
     # Games played: measured actual-GP std is ~13 for durable skaters and ~25 for
-    # injury-prone ones, so the width is interpolated on the same reliability score.
+    # injury-prone ones, so the width is interpolated on the same reliability score. In
+    # season the window is shorter, and the spread scales with its length: a player cannot
+    # miss twenty of the twelve games he has left. sqrt, because availability over a window
+    # behaves like a count of games missed and not like a fixed fraction of them.
+    cap = np.full(len(out), float(C.MAX_GP)) if gp_cap is None \
+        else np.broadcast_to(np.asarray(gp_cap, dtype=float), (len(out),)).astype(float)
     gp = out["proj_gp"].to_numpy(dtype=float)
-    gp_sigma = (25.0 - 12.0 * rel).to_numpy(dtype=float)
+    gp_sigma = (25.0 - 12.0 * rel).to_numpy(dtype=float) * np.sqrt(
+        np.clip(cap / float(C.MAX_GP), 0.0, 1.0))
     locked = out["lock_gp"].to_numpy(dtype=bool) if "lock_gp" in out else np.zeros(len(out), bool)
     gp_sigma = np.where(locked, 0.0, gp_sigma)
-    out["gp_p10"] = np.round(np.clip(gp - _PI_Z * gp_sigma, 0, C.MAX_GP), 1)
-    out["gp_p90"] = np.round(np.clip(gp + _PI_Z * gp_sigma, 0, C.MAX_GP), 1)
+    out["gp_p10"] = np.round(np.clip(gp - _PI_Z * gp_sigma, 0, cap), 1)
+    out["gp_p90"] = np.round(np.clip(gp + _PI_Z * gp_sigma, 0, cap), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -712,13 +903,18 @@ ROUND_1 = ["proj_gp", "proj_toi_per_gp", "proj_pp_toi_per_gp", "proj_sh_toi_per_
 
 
 def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
-                    with_budgets: bool = False):
+                    with_budgets: bool = False, in_season: bool | None = None):
     """Season-long skater projections, settled against team budgets.
 
     `scenario` carries the user's edits (see overrides.py); None is the pure model.
     With `with_budgets`, returns (skaters, team_budgets) -- the budget frame carries each
     team's allowance, what the roster covered and what is left for depth, which is what
     the app needs to show a reader why a number moved.
+
+    Once the season starts this becomes `act_* + ros_*`: what a player has already banked
+    plus the ordinary model run against the games his team has left. `in_season=False`
+    forces the preseason projection (which is how the two get compared); the default
+    follows `live.season_state()`.
     """
     sc = scenario
     cfg = sc.settings() if sc is not None else C.league_defaults()
@@ -728,17 +924,33 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
     regress_k = float(cfg["skater_regress_toi_min"])
     xg_weight = float(cfg["goals_xg_weight"])
 
-    hist = _prep_skater_seasons()
+    state = live.season_state()
+    use_live = state.live if in_season is None else bool(in_season and state.live)
+
+    hist = _prep_skater_seasons(with_live=use_live)
     curves = ac.build_skater_age_curves()
     toi_curve = ac.build_toi_age_curve()
     pos_means = _positional_means(hist)
 
     target = C.TARGET_SEASON
     recent_years = [target - i for i in range(1, C.SKATER_HISTORY_SEASONS + 1)]
+    if use_live:
+        # A player whose only NHL season is the one being played belongs in the claim pool,
+        # not in the rookie prior: three weeks of his own ice time beats a tier average.
+        recent_years.append(target)
     pool = hist[hist["mp_season_year"].isin(recent_years)].copy()
 
+    acts = live.skater_actuals() if use_live else pd.DataFrame()
+    act_map = {}
+    if not acts.empty:
+        act_map = {int(r.playerId): {"gp": float(r.act_gp), "toi": float(r.act_toi),
+                                     "pp_toi": float(r.act_pp_toi),
+                                     "sh_toi": float(r.act_sh_toi)}
+                   for r in acts.itertuples()}
+
     roster = dl.load_rosters(target)
-    rows = _claim_rows(pool, pos_means, curves, toi_curve, regress_k)
+    rows = _claim_rows(pool, pos_means, curves, toi_curve, regress_k, acts=act_map,
+                       team_played=state.team_games_played if use_live else 0.0)
     known = {r["playerId"] for r in rows}
     rows += _rookie_rows(roster, known, pos_means, curves, toi_curve)
     out = pd.DataFrame(rows)
@@ -778,6 +990,18 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
     out["status"] = np.where(out["on_roster"], "roster",
                              np.where(out.get("camp", False), "camp", "unsigned"))
 
+    # How many games each player still has in front of him. Preseason that is the whole
+    # season for everybody; in season it is his team's remaining games, which differ -- teams
+    # are routinely five games apart in November. Off-roster players get the league mean,
+    # because signing one in the app should not also change how long his season is.
+    if use_live:
+        rem_by_team = state.remaining
+        league_rem = float(rem_by_team.mean()) if len(rem_by_team) else max_gp
+        window = out["team"].map(rem_by_team).fillna(league_rem).to_numpy(dtype=float)
+        _to_rest_of_season_gp(out, window, act_map)
+    else:
+        window = np.full(len(out), max_gp, dtype=float)
+
     # Unconstrained totals, used for two different things: to shape the team budgets (a
     # team whose roster changed should carry a budget its NEW roster justifies) and, in
     # the app, to show what settlement did to each player.
@@ -796,9 +1020,15 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
     lvl = bg.league_level()
     teams = sorted(t for t in out.loc[out["on_roster"], "team"].unique() if t != FREE_AGENT)
     _apply_total_locks(out, sc, lvl)
+    if use_live:
+        # A stated season total is a statement about the SEASON, not about the games left, so
+        # what has to be honoured over the remaining games is the stated number minus what he
+        # has already banked. Without this, locking "50 goals" in February would ask for 50
+        # more of them.
+        _locks_to_rest_of_season(out, acts)
     tb = None
     if not enforce:
-        _no_budget_projection(out, max_gp)
+        _no_budget_projection(out, window)
     else:
         import context as ctx
         claims = out[out["on_roster"]].groupby("team")[
@@ -806,17 +1036,28 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
         claims.columns = COUNT_STATS
         tb = bg.team_budgets(target, teams=teams, claims=claims,
                              shrink=float(cfg["team_rating_shrink"]),
-                             games=int(max_gp))
+                             games=(state.remaining if use_live else int(max_gp)),
+                             live_rates=live.live_team_rates() if use_live else None)
         sos = ctx.schedule_context(target).groupby("team")["sos_factor"].first().to_dict()
         tb = _apply_sos(tb, sos)
         tb = _apply_team_edits(tb, sc, lvl)
-        _settle(out, tb, tilt, lvl, max_gp)
+        _settle(out, tb, tilt, lvl, window)
         if verbose:
             report = al.budget_report(out[out["on_roster"]], "claim_toi", "proj_toi",
                                       tb["toi_min"].to_dict())
             print(report.round(3).to_string())
 
-    _add_prediction_intervals(out)
+    _add_prediction_intervals(out, gp_cap=window)
+    if use_live:
+        # Everything above this line is the REST of the season. Add what is banked and every
+        # column in the frame means the same thing it meant preseason -- a full-season number
+        # -- so no page downstream has to know the difference. The `ros_*` and `act_*` columns
+        # are kept because the performance page has to score a projection against the window
+        # it was actually made for.
+        _fold_in_actuals(out, acts, state)
+        # The fold inserts three columns per stat one at a time, which leaves the frame
+        # badly fragmented; one copy here is cheaper than every later access paying for it.
+        out = out.copy()
 
     for col in out.columns:
         if col.startswith(("proj_", "claim_", "unc_", "rate_")) and \
@@ -830,16 +1071,22 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
     out.attrs["league_level"] = lvl
     out.attrs["scenario"] = "baseline" if sc is None else sc.name
     out.attrs["coverage"] = float(tb["toi_coverage"].mean()) if tb is not None else 1.0
+    out.attrs["in_season"] = bool(use_live)
+    out.attrs["team_games_played"] = float(state.team_games_played) if use_live else 0.0
+    out.attrs["frac_played"] = float(state.frac_played) if use_live else 0.0
+    out.attrs["as_of"] = str(state.as_of.date())
+    out.attrs["window"] = state.label()
     return (out, tb) if with_budgets else out
 
 
-def _no_budget_projection(out: pd.DataFrame, max_gp: float) -> None:
+def _no_budget_projection(out: pd.DataFrame, max_gp) -> None:
     """The old unconstrained behaviour, kept so the budgets can be switched off and seen.
 
     `enforce_budgets = False` in a scenario reproduces what the model did before team
     accounting existed. It is wrong -- that is the point of being able to look at it.
     """
-    out["proj_gp"] = out["claim_gp"].clip(0, max_gp)
+    out["proj_gp"] = out["claim_gp"].clip(lower=0.0, upper=pd.Series(
+        np.broadcast_to(np.asarray(max_gp, dtype=float), (len(out),)), index=out.index))
     out["proj_toi"] = out["claim_toi"]
     out["proj_toi_per_gp"] = out["claim_toi_per_gp"]
     for prefix in ("pp", "sh"):

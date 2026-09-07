@@ -302,10 +302,47 @@ def rating_persistence(stats: list[str] | None = None) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # the budgets themselves                                                      #
 # --------------------------------------------------------------------------- #
+def _games_series(games, idx: pd.Index) -> pd.Series:
+    """`games` as one number per team.
+
+    A full season gives every team the same number, but a season IN PROGRESS does not:
+    teams are routinely five games apart in November, and a team with 70 games left has a
+    smaller remaining budget than one with 75. So every budget below is written in terms of
+    a per-team game count, and the league totals that have to be conserved are the measured
+    per-game level times the SUM of it rather than times 32 x 84.
+    """
+    if games is None:
+        return pd.Series(float(C.SEASON_GAMES), index=idx)
+    if isinstance(games, pd.Series):
+        g = games.reindex(idx).astype(float)
+        return g.fillna(float(C.SEASON_GAMES) if g.isna().all() else g.mean())
+    return pd.Series(float(games), index=idx)
+
+
+def _in_season_rating(stat: str, hist_rating: pd.Series, idx: pd.Index,
+                      live: pd.DataFrame | None) -> pd.Series:
+    """Blend a team's historical rating with the rate it is posting THIS season.
+
+    Precision-weighted at `w = n / (n + C.IN_SEASON_TEAM_K)`, and that K is 39 team-games
+    because it was measured rather than picked: of the 0.114 cross-team variance in
+    goals-for per game, 0.038 is the sampling noise a Poisson count carries over a season,
+    leaving 0.076 of real spread, and a single game's noise variance is the mean itself.
+    Twenty games in, a team scoring 3.6 a game has earned about a third of the way toward
+    being a 3.6 team. Anything faster and the app chases hot starts, which is the easiest
+    way for an in-season projection to be worse than the preseason one.
+    """
+    if live is None or live.empty or stat not in live:
+        return hist_rating
+    n = live["games"].reindex(idx).fillna(0.0).astype(float)
+    w = n / (n + C.IN_SEASON_TEAM_K)
+    now = live[stat].reindex(idx).astype(float)
+    return hist_rating.where(now.isna(), (1.0 - w) * hist_rating + w * now.fillna(1.0))
+
+
 def team_budgets(season: int | None = None, teams: list[str] | None = None,
                  claims: pd.DataFrame | None = None, shrink: float | None = None,
-                 claim_weight: float | None = None, games: int | None = None
-                 ) -> pd.DataFrame:
+                 claim_weight: float | None = None, games=None,
+                 live_rates: pd.DataFrame | None = None) -> pd.DataFrame:
     """One row per team: how much of each quantity there is to allocate this season.
 
     `claims`, if given, is the per-team sum of the players' own unconstrained
@@ -314,22 +351,28 @@ def team_budgets(season: int | None = None, teams: list[str] | None = None,
     year's team, the claims know about this year's. The result is renormalised so the
     LEAGUE total is exactly the measured league level, which is the part that has to
     hold no matter how the shares are argued over.
+
+    `games` may be one number or one per team (see `_games_series`), which is how a
+    rest-of-season budget is asked for: the games each team has LEFT. `live_rates` is what
+    the teams have actually been doing this season (live.live_team_rates), blended into the
+    ratings at the measured in-season weight.
     """
     season = C.TARGET_SEASON if season is None else season
-    games = int(C.SEASON_GAMES if games is None else games)
     claim_weight = C.TEAM_CLAIM_WEIGHT if claim_weight is None else claim_weight
     lvl = league_level()
     if teams is None:
         teams = sorted(dl.load_schedule(season)["team"].unique())
     idx = pd.Index(teams, name="team")
+    g = _games_series(games, idx)
+    total_games = float(g.sum())
     ratings = team_ratings(season, shrink=shrink).reindex(idx)
 
     out = pd.DataFrame(index=idx)
-    out["games"] = games
+    out["games"] = g
     # Ice time and the number of skaters dressed are the clock and the rule book, not
-    # the team: every team gets exactly the same budget for both.
-    out["toi_min"] = lvl["toi_min"] * games
-    out["skater_games"] = lvl["dressed"] * games
+    # the team: every team gets exactly the same budget PER GAME for both.
+    out["toi_min"] = lvl["toi_min"] * g
+    out["skater_games"] = lvl["dressed"] * g
 
     scaled = ["goals", "ixg", "shots", "blocks", "hits", "pim", "faceoffs_won"]
     for stat in scaled:
@@ -337,6 +380,7 @@ def team_budgets(season: int | None = None, teams: list[str] | None = None,
             continue
         rating = ratings[stat] if stat in ratings else pd.Series(1.0, index=idx)
         rating = rating.fillna(1.0)
+        rating = _in_season_rating(stat, rating, idx, live_rates)
         if claims is not None and stat in claims:
             c = claims[stat].reindex(idx).fillna(0.0)
             if c.sum() > 0:
@@ -345,8 +389,8 @@ def team_budgets(season: int | None = None, teams: list[str] | None = None,
                 # of two multipliers is the one that does not favour the larger.
                 rating = (rating.clip(lower=0.2) ** (1.0 - claim_weight)) * \
                          (claim_rating.clip(lower=0.2) ** claim_weight)
-        raw = lvl[stat] * games * rating
-        out[stat] = raw * (lvl[stat] * games * len(idx) / raw.sum())
+        raw = lvl[stat] * g * rating
+        out[stat] = raw * (lvl[stat] * total_games / raw.sum())
 
     # Assists follow each team's OWN goals, at the league ratio. This is what makes
     # points internally consistent: team points = team goals x (1 + 0.935 + 0.751).
@@ -361,8 +405,9 @@ def team_budgets(season: int | None = None, teams: list[str] | None = None,
         if stat not in lvl:
             continue
         rating = ratings["goals"].fillna(1.0) if "goals" in ratings else pd.Series(1.0, index=idx)
-        raw = lvl[stat] * games * rating
-        out[stat] = raw * (lvl[stat] * games * len(idx) / raw.sum())
+        rating = _in_season_rating("goals", rating, idx, live_rates)
+        raw = lvl[stat] * g * rating
+        out[stat] = raw * (lvl[stat] * total_games / raw.sum())
     # Two different quantities, and conflating them would misprice every power-play
     # rate by a factor of five. `pp_toi_min` is how long the TEAM spends on the power
     # play; `pp_toi_min_skaters` is the sum of what its individual skaters accumulate,
@@ -370,13 +415,13 @@ def team_budgets(season: int | None = None, teams: list[str] | None = None,
     # claims settle against the second.
     for key, on_ice in (("pp_toi_min", 5.0), ("sh_toi_min", 4.0)):
         if key in lvl:
-            out[key] = lvl[key] * games
+            out[key] = lvl[key] * g
             out[f"{key}_skaters"] = out[key] * on_ice
     return out
 
 
 def goalie_budgets(season: int | None = None, teams: list[str] | None = None,
-                   games: int | None = None, claims: pd.DataFrame | None = None,
+                   games=None, claims: pd.DataFrame | None = None,
                    shrink: float | None = None, claim_weight: float | None = None
                    ) -> pd.DataFrame:
     """Per-team goalie budgets: starts, appearances, minutes, shots/goals against, wins.
@@ -400,13 +445,14 @@ def goalie_budgets(season: int | None = None, teams: list[str] | None = None,
     the rating knows about last year's goalies, the claims know about this year's.
     """
     season = C.TARGET_SEASON if season is None else season
-    games = int(C.SEASON_GAMES if games is None else games)
     shrink = C.TEAM_RATING_SHRINK if shrink is None else shrink
     claim_weight = C.TEAM_CLAIM_WEIGHT if claim_weight is None else claim_weight
     lvl = goalie_league_level()
     if teams is None:
         teams = sorted(dl.load_schedule(season)["team"].unique())
     idx = pd.Index(teams, name="team")
+    games = _games_series(games, idx)
+    total_games = float(games.sum())
 
     import context as ctx
     r = ctx.team_defense_ratings().set_index("team").reindex(idx)
@@ -431,19 +477,24 @@ def goalie_budgets(season: int | None = None, teams: list[str] | None = None,
 
     out = pd.DataFrame(index=idx)
     out["games"] = games
-    out["starts"] = float(games)
+    out["starts"] = games.astype(float)
     out["appearances"] = games * lvl["appearances_per_start"]
     # One goalie on the ice at a time: the minutes budget is the clock, so it is the same
     # for every team, exactly like the skaters' 297.4.
     out["minutes"] = games * lvl["min_per_start"]
 
-    def conserve(raw: pd.Series, per_team: float) -> pd.Series:
-        """Scale a rating-tilted budget so the LEAGUE total is the measured level."""
-        total = per_team * len(idx)
-        return raw * (total / raw.sum()) if raw.sum() > 0 else pd.Series(per_team, index=idx)
+    def conserve(raw: pd.Series, per_game: float) -> pd.Series:
+        """Scale a rating-tilted budget so the LEAGUE total is the measured level.
+
+        `per_game` is per team-game, so the league total is it times the games actually
+        being budgeted -- which is what keeps the identities exact when the teams are
+        partway through a season and are not all on the same game number.
+        """
+        total = per_game * total_games
+        return raw * (total / raw.sum()) if raw.sum() > 0 else per_game * games
 
     out["shots_against"] = conserve(lvl["sa_per_start"] * games / shot_sup,
-                                    lvl["sa_per_start"] * games)
+                                    lvl["sa_per_start"])
 
     ga_rating = 1.0 / goal_sup.clip(lower=0.2)      # >1 = allows more than average
     if claims is not None and {"goals_against", "shots_against"} <= set(claims):
@@ -460,17 +511,17 @@ def goalie_budgets(season: int | None = None, teams: list[str] | None = None,
             rate = (ga / sa / lg).fillna(1.0).clip(lower=0.6, upper=1.6)
             ga_rating = (ga_rating ** (1.0 - claim_weight)) * (rate ** claim_weight)
     out["goals_against"] = conserve(lvl["ga_per_start"] * games * ga_rating,
-                                     lvl["ga_per_start"] * games)
+                                     lvl["ga_per_start"])
 
     # Win share from team quality, normalised so the league wins exactly half its games.
-    league_wins = games / 2.0 * len(idx)
+    league_wins = total_games / 2.0
     quality = (off * dfn) ** 1.6      # a goal ratio converts to a win ratio super-linearly
     w = quality * (league_wins / quality.sum())
     w = w.clip(upper=games * 0.78)    # nobody has ever won 78% of an NHL season
     out["wins"] = w * (league_wins / w.sum())
 
-    out["shutouts"] = conserve(lvl["shutouts_per_team"] * (goal_sup ** 2),
-                                lvl["shutouts_per_team"])
+    out["shutouts"] = conserve(lvl["shutouts_per_start"] * games * (goal_sup ** 2),
+                                lvl["shutouts_per_start"])
     # Implied, and worth carrying: this is the save percentage the team's budgets say its
     # goaltending has to post, and a reader should be able to see it next to the goalies.
     out["sv_pct"] = 1.0 - out["goals_against"] / out["shots_against"]

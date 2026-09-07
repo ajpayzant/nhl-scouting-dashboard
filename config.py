@@ -6,7 +6,10 @@ ROOT = Path(__file__).resolve().parent
 DATA_RAW = ROOT / "data" / "raw"
 DATA_PROCESSED = ROOT / "data" / "processed"
 OUTPUT = ROOT / "output"
-for _d in (DATA_RAW, DATA_PROCESSED, OUTPUT):
+# Timestamped copies of the projection, so this season's accuracy can be measured against
+# what the model actually said at the time rather than against what it says now.
+SNAPSHOTS = ROOT / "data" / "snapshots"
+for _d in (DATA_RAW, DATA_PROCESSED, OUTPUT, SNAPSHOTS):
     _d.mkdir(parents=True, exist_ok=True)
 
 # --- Seasons ---
@@ -47,6 +50,61 @@ REQUEST_PAUSE = 0.4  # polite pause between NHL API calls
 def season_id(year: int) -> int:
     """MoneyPuck start-year -> NHL API seasonId (e.g. 2024 -> 20242025)."""
     return int(f"{year}{year + 1}")
+
+
+# --- The season in progress ---------------------------------------------------
+# Everything above this line is about completed seasons. Once the target season starts,
+# the most informative data about a player is the season he is playing, and a projection
+# that cannot see it is a preseason projection being served in March.
+#
+# So the target season is loaded like any other season (MoneyPuck publishes its file from
+# the first game night; the NHL goalie feed answers for it too) and enters the same rate
+# blend, and the projection becomes REST-OF-SEASON plus what is already banked. Nothing
+# about the settlement changes: a team's budget is its per-game budget times the games it
+# has LEFT, which is the same arithmetic as a full season with a smaller number.
+#
+# Weight on the season in progress, in the multi-season rate blend. The same weight as the
+# most recent completed season -- it is the most recent season -- and the ice-time
+# weighting inside the blend does the rest: after five games a player has ~5% of the
+# minutes of a full season, so he moves the blend by ~5%, and by March he owns it. That is
+# the correct behaviour and it needs no extra dial.
+LIVE_RECENCY_WEIGHT_INDEX = 0
+
+# How many team-games of the season in progress it takes to half-believe a team's own
+# scoring rate, over the rating built from its prior seasons. Measured, not chosen: across
+# 2015-2025 the cross-team variance in goals-for per game is 0.114, of which mean/G =
+# 0.038 is the sampling noise a Poisson count carries over a season, leaving 0.076 of real
+# spread in team quality. A single game's noise variance is the mean itself (2.96), so the
+# precision-weighted blend is w = n / (n + 2.96/0.076) = n / (n + 39).
+#
+# The number is large on purpose and it is the honest one: 20 games into a season, a team
+# that has scored 3.6 a game deserves only a third of the way toward being a 3.6 team. A
+# smaller K would make the app chase hot starts, which is the single easiest way for an
+# in-season projection to be worse than a preseason one.
+IN_SEASON_TEAM_K = 39.0
+
+# The same idea for a player's availability. A player's games-played share is close to
+# Bernoulli per game (cross-player variance ~0.023 against per-game noise ~0.13, i.e. K~6),
+# but injuries are not independent draws -- they come in blocks of twenty games -- so the
+# effective sample is far smaller than the game count suggests and K=6 would treat one
+# six-week injury as a permanent condition. Held at 20 team-games, which puts a player who
+# has missed a quarter of his team's games at roughly halfway toward being that player.
+# There is no injury feed here, so this is a prior and not a report: state the games on his
+# page if you know something the model cannot.
+IN_SEASON_GP_K = 20.0
+
+# Ice time per game is the fastest-moving thing in a season and the one a reader most wants
+# the projection to notice: a promotion to the first line shows up in three games. Its
+# within-player game-to-game noise (~3 min sd, var ~9) is small against the spread of real
+# roles (~4 min sd, var ~16), so the naive K is under one game; held at 8 player-games
+# because a single night's ice time is also score state, overtime and a short bench.
+IN_SEASON_TOI_K = 8.0
+
+# Below this many team-games, the season in progress is ignored entirely and the model
+# serves its preseason projection. Two games of data cannot beat five seasons of it, and
+# the rate machinery's own ice-time gate (MIN_ICETIME_SEC) would admit only the handful of
+# players who happened to play big minutes in them.
+IN_SEASON_MIN_TEAM_GAMES = 3
 
 # --- Projection parameters ---
 # Marcel-style recency weights, most-recent season first (season t-1 .. t-5). A FIVE-

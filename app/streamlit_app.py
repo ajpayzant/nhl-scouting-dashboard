@@ -32,10 +32,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 from views import (edits, export, games, goalies, home, model,  # noqa: E402
-                   player, skaters, teams)
+                   performance, player, skaters, teams)
 
 # Every view exposes a callable called `page`, so the URL path has to be given
-# explicitly -- Streamlit would otherwise infer all nine as "page".
+# explicitly -- Streamlit would otherwise infer all ten as "page".
 PAGES = [
     st.Page(home.page, title="Overview", icon=":material/home:", url_path="overview",
             default=True),
@@ -51,6 +51,8 @@ PAGES = [
             url_path="scenario"),
     st.Page(model.page, title="Model check", icon=":material/fact_check:",
             url_path="model"),
+    st.Page(performance.page, title="Model performance", icon=":material/timeline:",
+            url_path="performance"),
     st.Page(export.page, title="Export", icon=":material/download:", url_path="export"),
 ]
 

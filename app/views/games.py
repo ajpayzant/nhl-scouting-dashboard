@@ -75,7 +75,7 @@ def page() -> None:
             st.rerun()
         return
 
-    gm = core.games(core._skater_key(core.scenario()))
+    gm = core.games(core._skater_key(core.scenario()), core.live_token())
     tab_slate, tab_player = st.tabs(["A night's slate", "One player's schedule"])
     with tab_slate:
         _slate(gm)

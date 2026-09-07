@@ -42,8 +42,19 @@ CONSTANTS = [
 
 def _identities(sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
                 gb: pd.DataFrame) -> None:
-    teams, games = len(tb), float(core.C.SEASON_GAMES)
+    teams = len(tb)
+    # The identities are about the window being PROJECTED. Preseason that is 84 games a
+    # team; mid-season it is the games each team has left, and the allocation to check is
+    # the rest-of-season half -- the banked half is history and owes the budget nothing.
+    team_games = float(gb["games"].sum()) if "games" in gb else float(core.C.SEASON_GAMES) * teams
+    games = team_games / max(teams, 1)
+    in_season = bool(g.attrs.get("in_season"))
+    stem = "ros_" if in_season else "proj_"
     on_sk, on_g = sk[sk["on_roster"]], g[g["on_roster"]]
+    if in_season:
+        st.info(f"{core.window_label()}. The budgets below cover the games still to be "
+                f"played, so they are checked against the rest-of-season half of each "
+                f"projection — what is already banked is history and is not allocated.")
 
     st.markdown("**Goaltending — these are arithmetic, not opinion**")
     rows = []
@@ -57,7 +68,7 @@ def _identities(sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
         bcol = {"gp": "appearances"}.get(field, field)
         budget = float(gb[bcol].sum())
         expected = float((gb[bcol] * gb["coverage"]).sum())
-        got = float(on_g[f"proj_{field}"].sum())
+        got = float(on_g[f"{stem}{field}"].sum())
         rows.append({"": label, "Full budget": budget,
                      "Identity": identity if identity is not None else float("nan"),
                      "Budget x coverage": expected, "Allocated": got,
@@ -71,7 +82,7 @@ def _identities(sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
         "Off by": st.column_config.NumberColumn(format="%+.1f")})
 
     st.markdown("**Skaters, per team-game**")
-    tg = teams * games
+    tg = float(tb["games"].sum()) if "games" in tb else teams * games
     rows = []
     for stat, label in [("toi", "Ice time (min)"), ("goals", "Goals"),
                         ("assists", "Assists"), ("points", "Points"), ("shots", "Shots"),
@@ -83,7 +94,7 @@ def _identities(sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
         full = float(tb[bcol].sum()) / tg
         eff = (float(tb[f"eff_{bcol}"].sum()) if f"eff_{bcol}" in tb.columns
                else float((tb[bcol] * tb["toi_coverage"]).sum())) / tg
-        got = float(on_sk[f"proj_{stat}"].sum()) / tg
+        got = float(on_sk[f"{stem}{stat}"].sum()) / tg
         rows.append({"": label, "Full budget": full, "Budget x coverage": eff,
                      "Allocated": got, "Off by": got - eff})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
@@ -162,7 +173,7 @@ def _freshness() -> None:
                    "in the weeks before a season, and a stale one puts traded and cut "
                    "players on the wrong team — which costs a reader more manual work than "
                    "anything else in here.")
-    c1, c2 = st.columns([1.4, 3])
+    c1, c2, c3 = st.columns([1.4, 1.4, 2.4])
     if c1.button("Refresh rosters and schedule", width="stretch"):
         with st.spinner("Asking the NHL for all 32 rosters ..."):
             core.dl.load_rosters(refresh=True)
@@ -170,8 +181,18 @@ def _freshness() -> None:
         st.cache_data.clear()
         st.success("Rosters and schedule refreshed. The projection will rebuild.")
         st.rerun()
-    c2.caption("Season history is a bigger download and is only worth refreshing once a "
+    if c2.button("Refresh last night's stats", width="stretch",
+                 help="Three requests. The app does this hourly on its own; this is the "
+                      "button for when you want it now."):
+        with st.spinner("Fetching the season so far ..."):
+            counts = core.dl.refresh_live(schedule=False)
+        st.cache_data.clear()
+        st.success(f"Season in progress refreshed ({counts.get('skater_rows', 0)} skater "
+                   "rows). The projection will rebuild.")
+        st.rerun()
+    c3.caption("Season history is a bigger download and is only worth refreshing once a "
                "season has finished: run `python run.py --refresh` in the repo for that.")
+    st.caption(f"Window: {core.window_label()}.")
     st.caption(f"Projecting {core.SEASON_LABEL} from history through "
                f"{core.C.LAST_COMPLETED_SEASON}-"
                f"{str(core.C.LAST_COMPLETED_SEASON + 1)[-2:]}.")

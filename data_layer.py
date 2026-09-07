@@ -131,6 +131,145 @@ def refresh_skater_situations(situations=SITUATIONS) -> None:
             C.DATA_RAW / "mp_skaters_pp.parquet", index=False)
 
 
+# --------------------------------------------------------------------------- #
+# the season in progress                                                      #
+# --------------------------------------------------------------------------- #
+# Same sources, same schemas, one season -- the one being played. Kept in separate cache
+# files from the history for two reasons: the history is 18 seasons that will never change
+# again and should not be re-downloaded to learn last night's result, and the live file
+# needs refreshing on a completely different clock (nightly, or hourly from the app) than
+# the history does (never).
+#
+# Every one of these returns an EMPTY FRAME rather than raising when the season has not
+# started. MoneyPuck answers a request for an unplayed season with a redirect to its home
+# page, which arrives as HTML with a 200 or 302 and would otherwise land in pandas as a
+# one-column garbage frame, so the shape is checked and not just the status code.
+#
+# A season that has not started is asked about ONCE per process. Before opening night there
+# is no cache file, so every caller would otherwise re-request a URL that is already known to
+# 404 -- six wasted requests and six identical warnings in one `run.py`. An explicit refresh
+# always retries: the point of the daily job is to find out that the season has started.
+_LIVE_ABSENT: set[str] = set()
+
+
+def _live_moneypuck(url_tmpl: str, year: int, expect: str,
+                    retry: bool = True) -> pd.DataFrame:
+    """One MoneyPuck season file, or an empty frame if it is not published yet."""
+    url = url_tmpl.format(year=year)
+    if not retry and url in _LIVE_ABSENT:
+        return pd.DataFrame()
+
+    def absent(msg: str) -> pd.DataFrame:
+        _LIVE_ABSENT.add(url)
+        print(f"  [live] {msg}")
+        return pd.DataFrame()
+
+    try:
+        resp = _get(url)
+    except requests.RequestException as e:
+        return absent(f"{year} not available: {e}")
+    if "text/csv" not in resp.headers.get("Content-Type", "") and "<html" in resp.text[:400].lower():
+        return absent(f"{year} not published yet (got a web page, not a CSV)")
+    try:
+        df = pd.read_csv(io.StringIO(resp.text))
+    except (ValueError, pd.errors.ParserError) as e:
+        return absent(f"{year} unreadable: {e}")
+    if expect not in df.columns or df.empty:
+        return absent(f"{year} has no {expect} column yet")
+    _LIVE_ABSENT.discard(url)
+    df = df.copy()
+    df["mp_season_year"] = year
+    return df
+
+
+def load_live_skaters(season: int = C.TARGET_SEASON, refresh: bool = False,
+                      situation: str | None = None) -> pd.DataFrame:
+    """Season-to-date skater rows for the season in progress, every situation.
+
+    One download carries all situations, so it is cached whole and filtered on read --
+    the same trick `refresh_skater_situations` uses on the history, for the same reason.
+    """
+    cache = C.DATA_RAW / f"live_skaters_{season}.parquet"
+    if refresh or not cache.exists():
+        df = _live_moneypuck(C.MONEYPUCK_SKATERS, season, "icetime", retry=refresh)
+        if df.empty:
+            # Keep whatever was cached: a failed refresh must not delete last night's data.
+            df = pd.read_parquet(cache) if cache.exists() else df
+        else:
+            df.to_parquet(cache, index=False)
+    else:
+        df = pd.read_parquet(cache)
+    if df.empty or situation is None:
+        return df
+    return df[df["situation"] == situation].copy()
+
+
+def load_live_goalies(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.DataFrame:
+    """Season-to-date goalie summaries (W/L/SV%/GAA/starts) for the season in progress.
+
+    From the NHL feed rather than MoneyPuck, because that is where the goalie history in
+    this system comes from and the columns have to line up to be blended with it.
+    """
+    cache = C.DATA_RAW / f"live_goalies_{season}.parquet"
+    if not refresh and cache.exists():
+        return pd.read_parquet(cache)
+    key = f"nhl_goalies_{season}"
+    if not refresh and key in _LIVE_ABSENT:
+        return pd.DataFrame()
+
+    def absent(msg: str) -> pd.DataFrame:
+        _LIVE_ABSENT.add(key)
+        print(f"  [live] {msg}")
+        return pd.read_parquet(cache) if cache.exists() else pd.DataFrame()
+
+    try:
+        rows = _nhl_paged(C.NHL_GOALIE_SUMMARY, season)
+    except requests.RequestException as e:
+        return absent(f"goalie summary {season} unavailable: {e}")
+    if not rows:
+        return absent(f"no goalie rows for {season} yet")
+    _LIVE_ABSENT.discard(key)
+    df = pd.DataFrame(rows)
+    df["mp_season_year"] = season
+    df.to_parquet(cache, index=False)
+    return df
+
+
+def load_live_teams(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.DataFrame:
+    """Season-to-date team summaries for the season in progress (all situations)."""
+    cache = C.DATA_RAW / f"live_teams_{season}.parquet"
+    if refresh or not cache.exists():
+        df = _live_moneypuck(C.MONEYPUCK_TEAMS, season, "games_played", retry=refresh)
+        if df.empty:
+            df = pd.read_parquet(cache) if cache.exists() else df
+        else:
+            df = df[df["situation"] == "all"].copy()
+            df.to_parquet(cache, index=False)
+    else:
+        df = pd.read_parquet(cache)
+    return df
+
+
+def refresh_live(season: int = C.TARGET_SEASON, schedule: bool = True) -> dict:
+    """Re-download everything about the season in progress.
+
+    This is the call that makes the projection current, and it is deliberately separate
+    from `--refresh`: the 18 seasons of history behind it cannot change.
+
+    The stats are three requests and take about a second, which is why the app can afford
+    to make them hourly. The schedule is 32 (one per club) and the only thing that changes
+    in it is last night's results, so `schedule=False` skips it -- games PLAYED is read off
+    the stats file anyway, and the schedule is needed only for games remaining.
+    """
+    sk = load_live_skaters(season, refresh=True)
+    g = load_live_goalies(season, refresh=True)
+    t = load_live_teams(season, refresh=True)
+    out = {"skater_rows": len(sk), "goalie_rows": len(g), "team_rows": len(t)}
+    if schedule:
+        out["schedule_rows"] = len(load_schedule(season, refresh=True))
+    return out
+
+
 def load_moneypuck_teams_situation(situation: str, refresh: bool = False) -> pd.DataFrame:
     """Team summaries for one on-ice situation (team-level power-play / short-handed)."""
     cache = C.DATA_RAW / f"mp_teams_{situation}.parquet"
@@ -350,7 +489,15 @@ def load_schedule(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.Da
     """
     cache = C.DATA_RAW / f"schedule_{season}.parquet"
     if cache.exists() and not refresh:
-        return pd.read_parquet(cache)
+        cached = pd.read_parquet(cache)
+        # A schedule cached before results were tracked has no state columns. Fill them in
+        # rather than force a re-download: an unknown state reads as "not played yet", which
+        # is what every such file meant when it was written.
+        if "gameState" not in cached.columns:
+            cached["gameState"] = ""
+            cached["goals_for"] = float("nan")
+            cached["goals_against"] = float("nan")
+        return cached
 
     sid = C.season_id(season)
     seen_games = set()
@@ -367,11 +514,18 @@ def load_schedule(season: int = C.TARGET_SEASON, refresh: bool = False) -> pd.Da
             gid = g["id"]
             home = g["homeTeam"]["abbrev"]
             away = g["awayTeam"]["abbrev"]
-            for side, opp, is_home in ((home, away, True), (away, home, False)):
+            # gameState tells the projection how much of the season is already history:
+            # FUT/PRE = not played, LIVE/CRIT = in progress, FINAL/OFF = done. Scores are
+            # absent until a game starts, so they arrive as NaN and stay that way.
+            state = g.get("gameState", "")
+            hs, as_ = g["homeTeam"].get("score"), g["awayTeam"].get("score")
+            for side, opp, is_home, gf, ga in ((home, away, True, hs, as_),
+                                               (away, home, False, as_, hs)):
                 rows.append({
                     "gameId": gid, "gameDate": g["gameDate"], "season": season,
                     "team": side, "opponent": opp, "is_home": is_home,
                     "neutralSite": g.get("neutralSite", False),
+                    "gameState": state, "goals_for": gf, "goals_against": ga,
                 })
             seen_games.add(gid)
         time.sleep(C.REQUEST_PAUSE)

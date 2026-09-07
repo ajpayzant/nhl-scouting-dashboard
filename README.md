@@ -5,6 +5,11 @@ Season stat lines for every NHL skater and goalie for the upcoming season (curre
 rates, empirical age curves and a games-played model, then settled against what each team
 can actually produce.
 
+Once the season starts it keeps up with it: the projection becomes what a player has already
+banked plus what he does with the games his team has left, refreshed every morning, and a
+**Model performance** page scores the projections filed earlier in the year against what
+actually happened.
+
 The interface is a Streamlit app. The Excel workbook is still produced, as an export.
 
 ## Quick start
@@ -16,11 +21,17 @@ run_app.bat                 # open the app (or: python -m streamlit run app/stre
 ```
 
 ```bash
-python run.py               # write the projection CSVs to output/
-python run.py --games       # also write game-by-game projections
-python run.py --backtest    # also print the accuracy backtest
-python build_workbook.py    # the standalone Google-Sheets workbook, from the CSVs
+python run.py                 # write the projection CSVs to output/
+python run.py --refresh-live  # in season: re-download last night (3 requests) and reproject
+python run.py --snapshot      # also file a dated snapshot for the Model performance page
+python run.py --games         # also write game-by-game projections
+python run.py --backtest      # also print the accuracy backtest
+python build_workbook.py      # the standalone Google-Sheets workbook, from the CSVs
 ```
+
+Every run prints the window it projected — `preseason — the full 84-game season` in
+September, `31% of the season played (26.0 games a team) — banked totals plus 58.0 games to
+come` in December.
 
 ## Deploying it for other people
 
@@ -31,9 +42,16 @@ next majors of pandas and numpy so a reboot cannot silently upgrade under the ap
 The cached source data (`data/raw/*.parquet`, ~19 MB) **is committed on purpose**. A fresh
 container therefore boots in seconds instead of making several hundred API calls, and
 everyone reading the app is reading the same reviewable snapshot. `.github/workflows/refresh-data.yml`
-re-downloads it weekly and commits the diff, which Streamlit Cloud picks up as a redeploy;
-you can also run it from the Actions tab whenever a trade happens, or refresh locally and
-push.
+re-downloads it and commits the diff, which Streamlit Cloud picks up as a redeploy; you can
+also run it from the Actions tab whenever a trade happens, or refresh locally and push.
+
+It runs on **two cadences in one file**. Every morning it pulls the season in progress and
+the rosters — cheap, and necessary, because once games are being played last night's results
+are already part of the projection. On Tuesdays it re-downloads all five seasons of history
+as well, which is worth doing weekly and no more, since completed seasons do not change. Both
+live in the same workflow so they share a concurrency group and can never fight over a
+commit. The deployed app also refreshes the live season itself, hourly (`core.LIVE_TTL`), so
+a long-running container does not serve last week's numbers between pushes.
 
 **One person versus many.** The scenario is the app's only mutable state, and deployed it
 must not be shared: Streamlit gives each visitor a session but only one container and one
@@ -57,7 +75,7 @@ publishing still works, it just does not survive a restart.
 
 ## The app
 
-`app/streamlit_app.py` — nine pages, all reading the same cached projection:
+`app/streamlit_app.py` — ten pages, all reading the same cached projection:
 
 - **Overview** — where the season stands, the leaders, how many edits you have made
 - **Player dashboard** — one skater or goalie at a time: every prior season as totals *and* as
@@ -78,6 +96,10 @@ publishing still works, it just does not survive a restart.
 - **Game by game** — the season total spread over the real schedule
 - **Scenario** — every edit in one list, each one removable, plus the league-wide settings
 - **Model check** — the accounting identities, the measured constants, and how old the data is
+- **Model performance** — how the projections filed earlier this season have actually done:
+  which stats are most and least accurate, who was under- and over-projected, whether the
+  mid-season projection is beating the preseason one, and each player's chance of still
+  reaching the total he was given in September
 - **Export** — the workbook and the CSVs, with your edits in them
 
 Nothing in the app is destructive: edits live in `scenarios/working.json` as a list of only
@@ -149,6 +171,43 @@ Save percentage is regressed hard to the league (it is genuinely low-signal year
 then settled against the team's expected goals against, which moves it a point or two from
 the goalie's own rate — that gap is the shot quality he actually faces.
 
+### In season: banked totals plus the games that are left
+
+A preseason projection is a statement about 84 unplayed games. On opening night it stops
+being that, and a tool that keeps serving it is wrong in a way that gets worse every night.
+So from the moment three team-games have been played (`IN_SEASON_MIN_TEAM_GAMES`) every
+projection in the app becomes:
+
+```
+projection = what he has already done  +  what he does with the games that are left
+```
+
+The first half is not a projection at all, it is a fact. The second is the ordinary model run
+against a shorter season: a team's budget is its per-game budget times the games it has
+**left**, which is the same arithmetic with a smaller number in it. Nothing about the claim,
+the settlement or the budget tilt changes, and `proj_*` still means a full-season total — the
+banked half is added back at the end, with `act_*` and `ros_*` kept alongside it. That is
+deliberate: no page in the app needed rewriting to become in-season aware.
+
+**The bands narrow on their own.** The p10/p90 interval is drawn on the rest-of-season half
+and then shifted up by what is banked, so a player's remaining 20 games in February can move
+his total far less than his remaining 84 could in September. No separate rule makes that
+happen; it falls out of where the band is drawn.
+
+**Three signals, three speeds**, because they carry different amounts of information per game:
+
+| Signal | Constant | Half-weight at | Why |
+|---|---|---|---|
+| Ice time per game | `IN_SEASON_TOI_K` | 8 player-games | The fastest signal in the sport, and the one a reader most wants noticed: a promotion to the first line is visible in three games and the model's history cannot see it at all. |
+| Availability | `IN_SEASON_GP_K` | 20 team-games | A player who has missed 12 of his team's 20 games is a different bet for the rest of the year than his history says. |
+| Team budgets | `IN_SEASON_TEAM_K` | 39 team-games | Half a season before this year's team outscores its rating. Team results are mostly goaltending and schedule early on. |
+| Production rates | — | ~half a season | No dial at all: the live season enters through the ordinary ice-time-weighted rate blend, so it moves a player's per-60 by about 5% after five games and owns it by March. |
+
+That last row is the important restraint. Scoring rates are the part of a season most
+contaminated by luck, and chasing them is the single easiest way to make an in-season
+projection *worse* than the preseason one it replaced — which is precisely the claim the
+**Model performance** page exists to check rather than assert.
+
 ### Roster coverage: why the totals look conservative
 
 A published roster is not a season. A real team-season uses about 28 skaters and 3.1 goalies;
@@ -190,8 +249,14 @@ Cached to `data/raw/*.parquet`; re-runs are offline unless `--refresh`. Note tha
 `timeOnIce` in the NHL goalie summary is **seconds**, and that a traded goalie's row lists
 every team he played for — the split is not in the source data.
 
-The app's **Model check** page shows how old each cached file is and can refresh the rosters
-and schedule on its own, which are the parts that go stale in the weeks before a season.
+The season in progress is the same MoneyPuck files for the target year, cached separately as
+`data/raw/live_{skaters,goalies,teams}_2026.parquet`. Before opening night they 404, and every
+loader degrades to empty and keeps whatever is already cached — a failed pull must never delete
+last night's data.
+
+The app's **Model check** page shows how old each cached file is, states the window it is
+projecting, and has two buttons: refresh the rosters and schedule (the parts that go stale in
+the weeks before a season), and refresh last night's stats.
 
 ## Validation
 
@@ -203,6 +268,35 @@ The goalie start allocation was calibrated on 269 clean team-seasons (2012-2025)
 0.02454 → 0.02068, busiest-goalie start error 11.3 → 10.6 games, top-goalie identification
 73% → 75%.
 
+### Scoring the live season: snapshots
+
+The backtest grades the model on seasons that are over. `snapshots.py` grades it on the one
+being played. Each refresh files a dated, baseline-only copy of the projection — three numbers
+per stat (`act_` banked, `ros_` still to come, `proj_` the total) — and a copy that cannot be
+edited afterwards is the only honest basis for a scorecard. The cadence is measured in hockey
+rather than days: a new snapshot once three more team-games have been played, which lands near
+weekly and keeps September from filling with identical copies of the preseason projection.
+
+Each snapshot is scored **only on the games played after it was filed**, never against the
+season total, so no vintage is credited with knowing something it could not have known, and
+there is something to say from the second week of October. Two consequences worth knowing:
+
+- **Total error is split from rate error.** A projection can be right about a player and wrong
+  about how often he plays. The rate-only column charges the model just for the games he
+  really played, so a wide gap between the two columns says the model understands the player
+  and not his health — a different fix.
+- **Vintages are compared per game.** The preseason snapshot is judged over a longer window
+  than a January one, so only per-game error can sit in the same column. If that number does
+  not fall as the season runs, the in-season signal is not paying for itself, and the page
+  says so rather than letting anyone assume it is.
+
+The chance a player still reaches his September total comes from the model's own p10-p90 band
+on the games that are left, which needs no new assumption: an 80% band implies a standard
+deviation, and the question is whether banked plus rest clears the target.
+
+`data/snapshots/` is committed for the same reason `data/raw/` is — the deployed app has to be
+able to read a record it did not create.
+
 ## Files
 
 - `config.py` — seasons, source URLs, and every projection constant, each with the
@@ -213,11 +307,13 @@ The goalie start allocation was calibrated on 269 clean team-seasons (2012-2025)
 - `allocate.py` — the settle step: claims against a budget
 - `overrides.py` — scenarios (the edits, and the rules for what is editable)
 - `context.py` — team strength ratings, per-game schedule context
+- `live.py` — the season in progress: where it stands, what is banked, how fast to believe it
+- `snapshots.py` — dated projections and the scoring behind the Model performance page
 - `project_skaters.py` / `project_goalies.py` — the season models
 - `project_games.py` — top-down game-by-game decomposition (+ optional prop probabilities)
 - `backtest.py` — accuracy validation
 - `build_workbook.py` — the standalone Google-Sheets workbook
-- `run.py` — one-shot runner (`--refresh`, `--games`, `--backtest`)
+- `run.py` — one-shot runner (`--refresh`, `--refresh-live`, `--snapshot`, `--games`, `--backtest`)
 - `app/` — the Streamlit app (`core.py` is the shared plumbing; `views/` is one file per page)
 
 ## Not yet modelled
